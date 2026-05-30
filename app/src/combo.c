@@ -535,4 +535,39 @@ static int combo_init(void) {
 
 SYS_INIT(combo_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
 
+// Read-only public accessors (M1). M2 widens these to the mutable pool + writers.
+size_t zmk_combos_get_count(void) { return ARRAY_SIZE(combos); }
+
+int zmk_combos_get(uint16_t idx, struct zmk_combo *out) {
+    if (idx >= ARRAY_SIZE(combos)) {
+        return -EINVAL;
+    }
+
+    const struct combo_cfg *c = &combos[idx];
+
+    out->key_position_len = MIN(c->key_position_len, (int16_t)ZMK_COMBO_MAX_KEYS);
+    for (int i = 0; i < out->key_position_len; i++) {
+        out->key_positions[i] = c->key_positions[i];
+    }
+    out->timeout_ms = c->timeout_ms;
+    out->require_prior_idle_ms = c->require_prior_idle_ms;
+    out->layer_mask = c->layer_mask;
+    out->slow_release = c->slow_release;
+    out->behavior = c->behavior;
+
+    return 0;
+}
+
+#else // !DT_HAS_COMPAT_STATUS_OKAY(zmk_combos)
+
+// No combos defined in devicetree: keep the read API linkable for the Studio
+// combo subsystem (which is compiled whenever CONFIG_ZMK_STUDIO_RPC is on).
+size_t zmk_combos_get_count(void) { return 0; }
+
+int zmk_combos_get(uint16_t idx, struct zmk_combo *out) {
+    ARG_UNUSED(idx);
+    ARG_UNUSED(out);
+    return -EINVAL;
+}
+
 #endif
