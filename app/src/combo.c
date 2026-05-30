@@ -955,6 +955,12 @@ static int combo_handle_set(const char *name, size_t len, settings_read_cb read_
             .layer_mask = rec.layer_mask,
             .behavior =
                 (struct zmk_behavior_binding){
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_LOCAL_IDS_IN_BINDINGS)
+                    // Keep the raw local id so combo_handle_commit can re-resolve
+                    // the device name once every subsystem's settings have loaded
+                    // (the behavior local-id table may load after combos do).
+                    .local_id = rec.behavior_local_id,
+#endif
                     .behavior_dev = behavior_name,
                     .param1 = rec.param1,
                     .param2 = rec.param2,
@@ -974,6 +980,27 @@ static int combo_handle_set(const char *name, size_t len, settings_read_cb read_
 }
 
 static int combo_handle_commit(void) {
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_LOCAL_IDS_IN_BINDINGS)
+    // Settings commit runs after every subsystem's `set` callbacks, so the
+    // behavior local-id table is fully loaded by now. Re-resolve any combo whose
+    // behavior couldn't be resolved at load time (combo records may load before
+    // the local-id table). Mirrors keymap_handle_commit.
+    for (size_t i = 0; i < COMBO_POOL_SIZE; i++) {
+        if (!combo_used[i]) {
+            continue;
+        }
+        struct zmk_behavior_binding *binding = &combos[i].behavior;
+        if (binding->local_id > 0 && !binding->behavior_dev) {
+            binding->behavior_dev =
+                zmk_behavior_find_behavior_name_from_local_id(binding->local_id);
+            if (!binding->behavior_dev) {
+                LOG_ERR("Failed to find device for local ID %d after settings load",
+                        binding->local_id);
+            }
+        }
+    }
+#endif
+
     k_sched_lock();
     rebuild_combo_lookup();
     k_sched_unlock();
