@@ -70,6 +70,38 @@ int zmk_combos_get(uint16_t idx, struct zmk_combo *out);
 // Replace the combo occupying pool slot idx in place. Validates key positions
 // (< ZMK_KEYMAP_LEN, count in [1, effective max]) and the binding. If the slot
 // is currently an active (pressed) combo it is force-released first. Rebuilds
-// the combo lookup table. Returns 0 on success, -EINVAL on invalid input,
-// -ENOTSUP when runtime editing is disabled.
+// the combo lookup table. Marks the slot as having unsaved changes. Returns 0 on
+// success, -EINVAL on invalid input, -ENOTSUP when runtime editing is disabled.
 int zmk_combos_set(uint16_t idx, const struct zmk_combo *combo);
+
+// Create a new combo in the lowest free pool slot (M4). Validates exactly like
+// zmk_combos_set, marks the slot used + dirty, and rebuilds the lookup table.
+// Returns the assigned pool index (>= 0) on success, -ENOSPC when the pool is
+// full, -EINVAL on invalid input, or -ENOTSUP when runtime editing is disabled.
+int zmk_combos_add(const struct zmk_combo *combo);
+
+// Delete the combo occupying pool slot idx (M4): force-release it if currently
+// pressed, free + zero the slot, mark it dirty, and rebuild the lookup table.
+// Returns 0 on success, -EINVAL if idx is out of range, -ENOENT if the slot is
+// already empty, or -ENOTSUP when runtime editing is disabled. A persisted
+// deletion of a devicetree (stock) combo is recorded as a tombstone by
+// zmk_combos_save_changes so it does not resurrect on reboot.
+int zmk_combos_remove(uint16_t idx);
+
+// Returns non-zero if any pool slot has unsaved (un-persisted) changes.
+int zmk_combos_check_unsaved_changes(void);
+
+// Persist every dirty pool slot to NVS ("combos/c/<idx>"), clearing its dirty
+// bit. Returns 0 on success, a negative errno on failure (-ENOSPC when the
+// settings partition is full), or -ENOTSUP when runtime editing is disabled.
+int zmk_combos_save_changes(void);
+
+// Drop all unsaved edits: reseed the pool from the devicetree defaults, re-apply
+// the persisted NVS records on top, and clear the dirty bits. Returns 0 on
+// success, a negative errno on failure, or -ENOTSUP when runtime editing is off.
+int zmk_combos_discard_changes(void);
+
+// Delete all persisted combo records and reseed the pool from the devicetree
+// defaults (the Studio settings-reset hook). Returns 0, or -ENOTSUP when runtime
+// editing is disabled.
+int zmk_combos_reset_settings(void);

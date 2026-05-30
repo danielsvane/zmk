@@ -454,10 +454,14 @@ config ZMK_COMBO_MAX_PRESSED_COMBOS
 config ZMK_COMBO_RUNTIME_EDITING
     bool "Runtime combo editing (ZMK Studio)"
     default y if ZMK_STUDIO_RPC
+    select SETTINGS
+    select ZMK_BEHAVIOR_LOCAL_IDS
+    select ZMK_KEYMAP_SETTINGS_STORAGE
     help
       Replace the compile-time combo array with a mutable bounded pool so combos
       can be created, edited and deleted at runtime over the Studio RPC protocol.
-      (NVS persistence is added separately - see ZMK_KEYMAP_SETTINGS_STORAGE.)
+      Runtime edits are persisted to NVS (reusing the keymap settings-storage
+      machinery, which the selects above pull in).
 
 if ZMK_COMBO_RUNTIME_EDITING
 

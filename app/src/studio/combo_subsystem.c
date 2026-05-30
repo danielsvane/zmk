@@ -84,37 +84,27 @@ zmk_studio_Response get_combos(const zmk_studio_Request *req) {
 
 ZMK_RPC_SUBSYSTEM_HANDLER(combos, get_combos, ZMK_STUDIO_RPC_HANDLER_SECURED);
 
-zmk_studio_Response set_combo(const zmk_studio_Request *req) {
-    LOG_DBG("");
-    const zmk_combos_SetComboRequest *set_req = &req->subsystem.combos.request_type.set_combo;
-
-    if (!set_req->has_combo) {
-        return COMBOS_RESPONSE(set_combo,
-                               zmk_combos_SetComboResponse_SET_COMBO_RESP_INVALID_LOCATION);
-    }
-
-    const zmk_combos_Combo *src = &set_req->combo;
-
+// Convert a wire Combo into the public DTO, resolving the behavior local-id to a
+// device name (mirror set_layer_binding) and validating the binding. Returns
+// SET_COMBO_RESP_OK on success, or the matching error code. Shared by set_combo
+// and add_combo; add_combo maps these onto its own enum.
+static zmk_combos_SetComboResponse combo_from_proto(const zmk_combos_Combo *src,
+                                                    struct zmk_combo *out) {
     if (src->key_positions_count > ZMK_COMBO_MAX_KEYS) {
-        return COMBOS_RESPONSE(set_combo,
-                               zmk_combos_SetComboResponse_SET_COMBO_RESP_INVALID_LOCATION);
+        return zmk_combos_SetComboResponse_SET_COMBO_RESP_INVALID_LOCATION;
     }
 
     if (!src->has_binding) {
-        return COMBOS_RESPONSE(set_combo,
-                               zmk_combos_SetComboResponse_SET_COMBO_RESP_INVALID_BEHAVIOR);
+        return zmk_combos_SetComboResponse_SET_COMBO_RESP_INVALID_BEHAVIOR;
     }
 
-    // Resolve the behavior by local id -> name (mirror set_layer_binding); the
-    // binding resolves by name at invoke time, so in-place edits are safe.
     const char *behavior_name =
         zmk_behavior_find_behavior_name_from_local_id(src->binding.behavior_id);
     if (!behavior_name) {
-        return COMBOS_RESPONSE(set_combo,
-                               zmk_combos_SetComboResponse_SET_COMBO_RESP_INVALID_BEHAVIOR);
+        return zmk_combos_SetComboResponse_SET_COMBO_RESP_INVALID_BEHAVIOR;
     }
 
-    struct zmk_combo combo = {
+    *out = (struct zmk_combo){
         .timeout_ms = src->timeout_ms,
         .require_prior_idle_ms = src->require_prior_idle_ms,
         .layer_mask = src->layers,
@@ -128,16 +118,32 @@ zmk_studio_Response set_combo(const zmk_studio_Request *req) {
             },
     };
     for (size_t i = 0; i < src->key_positions_count; i++) {
-        combo.key_positions[i] = src->key_positions[i];
+        out->key_positions[i] = src->key_positions[i];
     }
 
-    int ret = zmk_behavior_validate_binding(&combo.behavior);
-    if (ret < 0) {
+    if (zmk_behavior_validate_binding(&out->behavior) < 0) {
+        return zmk_combos_SetComboResponse_SET_COMBO_RESP_INVALID_PARAMETERS;
+    }
+
+    return zmk_combos_SetComboResponse_SET_COMBO_RESP_OK;
+}
+
+zmk_studio_Response set_combo(const zmk_studio_Request *req) {
+    LOG_DBG("");
+    const zmk_combos_SetComboRequest *set_req = &req->subsystem.combos.request_type.set_combo;
+
+    if (!set_req->has_combo) {
         return COMBOS_RESPONSE(set_combo,
-                               zmk_combos_SetComboResponse_SET_COMBO_RESP_INVALID_PARAMETERS);
+                               zmk_combos_SetComboResponse_SET_COMBO_RESP_INVALID_LOCATION);
     }
 
-    ret = zmk_combos_set(set_req->index, &combo);
+    struct zmk_combo combo;
+    zmk_combos_SetComboResponse conv = combo_from_proto(&set_req->combo, &combo);
+    if (conv != zmk_combos_SetComboResponse_SET_COMBO_RESP_OK) {
+        return COMBOS_RESPONSE(set_combo, conv);
+    }
+
+    int ret = zmk_combos_set(set_req->index, &combo);
     if (ret < 0) {
         LOG_WRN("Setting combo %d failed with %d", set_req->index, ret);
         switch (ret) {
@@ -156,6 +162,138 @@ zmk_studio_Response set_combo(const zmk_studio_Request *req) {
 }
 
 ZMK_RPC_SUBSYSTEM_HANDLER(combos, set_combo, ZMK_STUDIO_RPC_HANDLER_SECURED);
+
+zmk_studio_Response add_combo(const zmk_studio_Request *req) {
+    LOG_DBG("");
+    const zmk_combos_AddComboRequest *add_req = &req->subsystem.combos.request_type.add_combo;
+
+    zmk_combos_AddComboResponse resp = zmk_combos_AddComboResponse_init_zero;
+    resp.which_result = zmk_combos_AddComboResponse_err_tag;
+
+    if (!add_req->has_combo) {
+        resp.result.err = zmk_combos_AddComboErrorCode_ADD_COMBO_ERR_INVALID_PARAMETERS;
+        return COMBOS_RESPONSE(add_combo, resp);
+    }
+
+    struct zmk_combo combo;
+    zmk_combos_SetComboResponse conv = combo_from_proto(&add_req->combo, &combo);
+    if (conv != zmk_combos_SetComboResponse_SET_COMBO_RESP_OK) {
+        resp.result.err = zmk_combos_AddComboErrorCode_ADD_COMBO_ERR_INVALID_PARAMETERS;
+        return COMBOS_RESPONSE(add_combo, resp);
+    }
+
+    int ret = zmk_combos_add(&combo);
+    if (ret < 0) {
+        LOG_WRN("Adding combo failed with %d", ret);
+        resp.result.err = (ret == -ENOSPC)
+                              ? zmk_combos_AddComboErrorCode_ADD_COMBO_ERR_NO_SPACE
+                              : zmk_combos_AddComboErrorCode_ADD_COMBO_ERR_GENERIC;
+        return COMBOS_RESPONSE(add_combo, resp);
+    }
+
+    resp.which_result = zmk_combos_AddComboResponse_ok_tag;
+    resp.result.ok.index = (uint32_t)ret;
+    resp.result.ok.has_combo = true;
+    resp.result.ok.combo = add_req->combo;
+
+    raise_zmk_studio_rpc_notification((struct zmk_studio_rpc_notification){
+        .notification = COMBOS_NOTIFICATION(unsaved_changes_status_changed, true)});
+
+    return COMBOS_RESPONSE(add_combo, resp);
+}
+
+ZMK_RPC_SUBSYSTEM_HANDLER(combos, add_combo, ZMK_STUDIO_RPC_HANDLER_SECURED);
+
+zmk_studio_Response remove_combo(const zmk_studio_Request *req) {
+    LOG_DBG("");
+    const zmk_combos_RemoveComboRequest *rm_req = &req->subsystem.combos.request_type.remove_combo;
+
+    zmk_combos_RemoveComboResponse resp = zmk_combos_RemoveComboResponse_init_zero;
+
+    int ret = zmk_combos_remove(rm_req->index);
+    if (ret < 0) {
+        LOG_WRN("Removing combo %d failed with %d", rm_req->index, ret);
+        resp.which_result = zmk_combos_RemoveComboResponse_err_tag;
+        resp.result.err = (ret == -EINVAL || ret == -ENOENT)
+                              ? zmk_combos_RemoveComboErrorCode_REMOVE_COMBO_ERR_INVALID_INDEX
+                              : zmk_combos_RemoveComboErrorCode_REMOVE_COMBO_ERR_GENERIC;
+        return COMBOS_RESPONSE(remove_combo, resp);
+    }
+
+    resp.which_result = zmk_combos_RemoveComboResponse_ok_tag;
+
+    raise_zmk_studio_rpc_notification((struct zmk_studio_rpc_notification){
+        .notification = COMBOS_NOTIFICATION(unsaved_changes_status_changed, true)});
+
+    return COMBOS_RESPONSE(remove_combo, resp);
+}
+
+ZMK_RPC_SUBSYSTEM_HANDLER(combos, remove_combo, ZMK_STUDIO_RPC_HANDLER_SECURED);
+
+// These three share request-id names with the keymap subsystem; keep them
+// static so the handler symbols don't collide at link time.
+static zmk_studio_Response check_unsaved_changes(const zmk_studio_Request *req) {
+    LOG_DBG("");
+    return COMBOS_RESPONSE(check_unsaved_changes, zmk_combos_check_unsaved_changes() > 0);
+}
+
+ZMK_RPC_SUBSYSTEM_HANDLER(combos, check_unsaved_changes, ZMK_STUDIO_RPC_HANDLER_SECURED);
+
+static void map_errno_to_save_resp(int err, zmk_combos_SaveChangesResponse *resp) {
+    resp->which_result = zmk_combos_SaveChangesResponse_err_tag;
+
+    switch (err) {
+    case -ENOTSUP:
+        resp->result.err = zmk_combos_SaveChangesErrorCode_SAVE_CHANGES_ERR_NOT_SUPPORTED;
+        break;
+    case -ENOSPC:
+        resp->result.err = zmk_combos_SaveChangesErrorCode_SAVE_CHANGES_ERR_NO_SPACE;
+        break;
+    default:
+        resp->result.err = zmk_combos_SaveChangesErrorCode_SAVE_CHANGES_ERR_GENERIC;
+        break;
+    }
+}
+
+static zmk_studio_Response save_changes(const zmk_studio_Request *req) {
+    LOG_DBG("");
+    zmk_combos_SaveChangesResponse resp = zmk_combos_SaveChangesResponse_init_zero;
+    resp.which_result = zmk_combos_SaveChangesResponse_ok_tag;
+    resp.result.ok = true;
+
+    int ret = zmk_combos_save_changes();
+    if (ret < 0) {
+        LOG_WRN("Failed to save combo changes (%d)", ret);
+        map_errno_to_save_resp(ret, &resp);
+        return COMBOS_RESPONSE(save_changes, resp);
+    }
+
+    raise_zmk_studio_rpc_notification((struct zmk_studio_rpc_notification){
+        .notification = COMBOS_NOTIFICATION(unsaved_changes_status_changed, false)});
+
+    return COMBOS_RESPONSE(save_changes, resp);
+}
+
+ZMK_RPC_SUBSYSTEM_HANDLER(combos, save_changes, ZMK_STUDIO_RPC_HANDLER_SECURED);
+
+static zmk_studio_Response discard_changes(const zmk_studio_Request *req) {
+    LOG_DBG("");
+    int ret = zmk_combos_discard_changes();
+    if (ret < 0) {
+        return ZMK_RPC_SIMPLE_ERR(GENERIC);
+    }
+
+    raise_zmk_studio_rpc_notification((struct zmk_studio_rpc_notification){
+        .notification = COMBOS_NOTIFICATION(unsaved_changes_status_changed, false)});
+
+    return COMBOS_RESPONSE(discard_changes, true);
+}
+
+ZMK_RPC_SUBSYSTEM_HANDLER(combos, discard_changes, ZMK_STUDIO_RPC_HANDLER_SECURED);
+
+static int combos_settings_reset(void) { return zmk_combos_reset_settings(); }
+
+ZMK_RPC_SUBSYSTEM_SETTINGS_RESET(combos, combos_settings_reset);
 
 static int event_mapper(const zmk_event_t *eh, zmk_studio_Notification *n) { return 0; }
 

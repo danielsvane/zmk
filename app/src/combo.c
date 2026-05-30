@@ -11,6 +11,7 @@
 #include <zephyr/sys/dlist.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/kernel.h>
+#include <zephyr/settings/settings.h>
 
 #include <drivers/behavior.h>
 
@@ -25,7 +26,14 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
-#if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)
+// Whether any combos are defined in devicetree. The runtime-editing pool can run
+// with zero devicetree combos (the common Studio case: build empty, add all at
+// runtime), so the file body is gated on "DT combos OR runtime editing". The
+// few constructs that genuinely need a devicetree instance (the stock seed array
+// and the DT-derived key count) are sub-gated on HAS_DT_COMBOS below.
+#define HAS_DT_COMBOS DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)
+
+#if HAS_DT_COMBOS || IS_ENABLED(CONFIG_ZMK_COMBO_RUNTIME_EDITING)
 
 #if CONFIG_ZMK_COMBO_MAX_KEYS_PER_COMBO > 0
 
@@ -43,7 +51,13 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define COMBOS_KEYS_BYTE_ARRAY(node_id)                                                            \
     uint8_t _CONCAT(combo_prop_, node_id)[DT_PROP_LEN(node_id, key_positions)];
 
+#if HAS_DT_COMBOS
 #define DT_MAX_COMBO_KEYS sizeof(union {DT_INST_FOREACH_CHILD(0, COMBOS_KEYS_BYTE_ARRAY)})
+#else
+// No devicetree combos: nothing to derive a key count from. MAX_COMBO_KEYS falls
+// back entirely to the runtime Kconfig (MAX(0, ...) below).
+#define DT_MAX_COMBO_KEYS 0
+#endif
 
 // Effective per-combo key capacity, used to size combo_cfg/active_combo storage.
 // With runtime editing on, users can create combos with more keys than any
@@ -121,11 +135,25 @@ struct active_combo {
 // simply have no combo_lookup bit set, so the match loops never select them.
 #define COMBO_POOL_SIZE CONFIG_ZMK_COMBO_MAX_COMBOS
 
+#if HAS_DT_COMBOS
 static const struct combo_cfg combo_stock[] = {
     LISTIFY(20, COMBO_CONFIGS_WITH_MATCHING_POSITIONS_LEN, (), 0)};
+#define COMBO_STOCK_COUNT ARRAY_SIZE(combo_stock)
+#else
+// No devicetree combos to seed from: the pool starts empty and is populated
+// entirely at runtime. The 1-element dummy avoids a zero-length array; it is
+// never read because COMBO_STOCK_COUNT is 0 (reseed guards on i < count).
+static const struct combo_cfg combo_stock[1] = {0};
+#define COMBO_STOCK_COUNT 0
+#endif
 
 static struct combo_cfg combos[COMBO_POOL_SIZE];
 static bool combo_used[COMBO_POOL_SIZE];
+
+// Dirty-bit array: one bit per pool slot, set when a slot is edited and cleared
+// when it is persisted (M3). check_unsaved_changes is the OR of these bits.
+#define COMBO_PENDING_ARRAY_SIZE DIV_ROUND_UP(COMBO_POOL_SIZE, 8)
+static uint8_t combo_pending_changes[COMBO_PENDING_ARRAY_SIZE];
 
 #else
 
@@ -580,6 +608,22 @@ static void rebuild_combo_lookup(void) {
     }
 }
 
+// Reset the working pool to the devicetree defaults: slots backed by a stock
+// combo are restored and marked used; all other slots are cleared and freed.
+// Used at init and as the first step of discard/reset before re-applying NVS.
+// Callers must hold k_sched_lock (it mutates the pool the match loops read).
+static void reseed_combos_from_stock(void) {
+    for (size_t i = 0; i < COMBO_POOL_SIZE; i++) {
+        if (i < COMBO_STOCK_COUNT) {
+            combos[i] = combo_stock[i];
+            combo_used[i] = true;
+        } else {
+            combos[i] = (struct combo_cfg){0};
+            combo_used[i] = false;
+        }
+    }
+}
+
 // If pool slot idx is currently a pressed (active) combo, force-release its
 // behavior against the OLD definition and free the active-combo entry before
 // the slot is mutated. Invokes a behavior, so it runs outside k_sched_lock.
@@ -603,13 +647,11 @@ static int combo_init(void) {
     k_work_init_delayable(&timeout_task, combo_timeout_handler);
 
 #if IS_ENABLED(CONFIG_ZMK_COMBO_RUNTIME_EDITING)
-    // Seed the mutable pool from the devicetree defaults.
-    for (size_t i = 0; i < ARRAY_SIZE(combo_stock); i++) {
-        combos[i] = combo_stock[i];
-        combo_used[i] = true;
-    }
-    LOG_WRN("Have %d combos (pool size %d)!", (int)ARRAY_SIZE(combo_stock), COMBO_POOL_SIZE);
+    // Seed the mutable pool from the devicetree defaults. Saved NVS edits are
+    // applied later by the settings handler during settings_load() in main().
+    LOG_WRN("Have %d combos (pool size %d)!", (int)COMBO_STOCK_COUNT, COMBO_POOL_SIZE);
     k_sched_lock();
+    reseed_combos_from_stock();
     rebuild_combo_lookup();
     k_sched_unlock();
 #else
@@ -699,11 +741,246 @@ int zmk_combos_set(uint16_t idx, const struct zmk_combo *combo) {
     k_sched_lock();
     combos[idx] = cfg;
     combo_used[idx] = true;
+    WRITE_BIT(combo_pending_changes[idx / 8], idx % 8, 1);
     rebuild_combo_lookup();
     k_sched_unlock();
 
     return 0;
 }
+
+int zmk_combos_add(const struct zmk_combo *combo) {
+    for (size_t i = 0; i < COMBO_POOL_SIZE; i++) {
+        if (!combo_used[i]) {
+            // zmk_combos_set validates the input, marks the slot used + dirty,
+            // and rebuilds the lookup. A fresh slot is never an active combo, so
+            // its internal release-if-present is a no-op here.
+            int ret = zmk_combos_set((uint16_t)i, combo);
+            if (ret < 0) {
+                return ret;
+            }
+            return (int)i;
+        }
+    }
+
+    return -ENOSPC;
+}
+
+int zmk_combos_remove(uint16_t idx) {
+    if (idx >= COMBO_POOL_SIZE) {
+        return -EINVAL;
+    }
+    if (!combo_used[idx]) {
+        return -ENOENT;
+    }
+
+    // If this slot is currently pressed, release its behavior against the old
+    // definition before freeing it (invokes a behavior, so do it before locking).
+    release_active_combo_if_present(idx);
+
+    k_sched_lock();
+    combos[idx] = (struct combo_cfg){0};
+    combo_used[idx] = false;
+    WRITE_BIT(combo_pending_changes[idx / 8], idx % 8, 1);
+    rebuild_combo_lookup();
+    k_sched_unlock();
+
+    return 0;
+}
+
+// On-disk record for one combo slot. __packed + a save-only-used-length trim
+// (see zmk_combos_save_changes) keeps NVS writes small. Behavior is stored as a
+// local id (resolved to a device name at load time, mirroring the keymap), so
+// in-place edits and reflashes stay valid.
+struct zmk_combo_setting {
+    uint8_t key_position_len;
+    uint8_t slow_release;
+    int16_t require_prior_idle_ms;
+    int32_t timeout_ms;
+    uint32_t layer_mask;
+    zmk_behavior_local_id_t behavior_local_id;
+    uint32_t param1;
+    uint32_t param2;
+    int16_t key_positions[MAX_COMBO_KEYS];
+} __packed;
+
+#define COMBO_SETTINGS_KEY "combos/c/%d"
+
+int zmk_combos_check_unsaved_changes(void) {
+    for (size_t i = 0; i < COMBO_POOL_SIZE; i++) {
+        if (combo_pending_changes[i / 8] & BIT(i % 8)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int zmk_combos_save_changes(void) {
+    for (size_t i = 0; i < COMBO_POOL_SIZE; i++) {
+        if (!(combo_pending_changes[i / 8] & BIT(i % 8))) {
+            continue;
+        }
+
+        char setting_name[16];
+        sprintf(setting_name, COMBO_SETTINGS_KEY, (int)i);
+
+        int ret;
+        if (combo_used[i]) {
+            const struct combo_cfg *c = &combos[i];
+            struct zmk_combo_setting rec = {
+                .key_position_len = (uint8_t)c->key_position_len,
+                .slow_release = c->slow_release ? 1 : 0,
+                .require_prior_idle_ms = c->require_prior_idle_ms,
+                .timeout_ms = c->timeout_ms,
+                .layer_mask = c->layer_mask,
+                .behavior_local_id = zmk_behavior_get_local_id(c->behavior.behavior_dev),
+                .param1 = c->behavior.param1,
+                .param2 = c->behavior.param2,
+            };
+            int kp_count = MIN((int)c->key_position_len, MAX_COMBO_KEYS);
+            for (int kp = 0; kp < kp_count; kp++) {
+                rec.key_positions[kp] = (int16_t)c->key_positions[kp];
+            }
+
+            // Trim trailing unused key_positions slots (same trick as keymap).
+            size_t len =
+                offsetof(struct zmk_combo_setting, key_positions) + kp_count * sizeof(int16_t);
+
+            ret = settings_save_one(setting_name, &rec, len);
+        } else if (i < COMBO_STOCK_COUNT) {
+            // Deleted a devicetree (stock) combo. A plain settings_delete is not
+            // enough: on reboot combo_init reseeds stock slots as used, and with
+            // no saved record to override slot i the deleted combo would
+            // resurrect. Persist a tombstone (a record with key_position_len == 0,
+            // which zmk_combos_set never produces) so the settings load handler
+            // re-empties the slot.
+            struct zmk_combo_setting tombstone = {0};
+            size_t len = offsetof(struct zmk_combo_setting, key_positions);
+            ret = settings_save_one(setting_name, &tombstone, len);
+        } else {
+            // Freed non-stock slot: nothing reseeds it, so just drop any record
+            // it had. settings_delete on a never-saved key is harmless.
+            ret = settings_delete(setting_name);
+        }
+
+        if (ret < 0) {
+            LOG_ERR("Failed to persist combo %d (%d)", (int)i, ret);
+            return ret;
+        }
+
+        WRITE_BIT(combo_pending_changes[i / 8], i % 8, 0);
+    }
+
+    return 0;
+}
+
+int zmk_combos_discard_changes(void) {
+    k_sched_lock();
+    reseed_combos_from_stock();
+    k_sched_unlock();
+
+    // Re-apply persisted edits over the stock pool via the settings handler.
+    int ret = settings_load_subtree("combos");
+
+    k_sched_lock();
+    rebuild_combo_lookup();
+    memset(combo_pending_changes, 0, sizeof(combo_pending_changes));
+    k_sched_unlock();
+
+    return ret;
+}
+
+int zmk_combos_reset_settings(void) {
+    for (size_t i = 0; i < COMBO_POOL_SIZE; i++) {
+        char setting_name[16];
+        sprintf(setting_name, COMBO_SETTINGS_KEY, (int)i);
+        settings_delete(setting_name);
+    }
+
+    k_sched_lock();
+    reseed_combos_from_stock();
+    memset(combo_pending_changes, 0, sizeof(combo_pending_changes));
+    rebuild_combo_lookup();
+    k_sched_unlock();
+
+    return 0;
+}
+
+static int combo_handle_set(const char *name, size_t len, settings_read_cb read_cb, void *cb_arg) {
+    const char *next;
+
+    if (settings_name_steq(name, "c", &next) && next) {
+        char *endptr;
+        uint16_t idx = strtoul(next, &endptr, 10);
+        if (*endptr != '\0') {
+            LOG_WRN("Invalid combo index in settings key: %s", next);
+            return -EINVAL;
+        }
+        if (idx >= COMBO_POOL_SIZE) {
+            LOG_WRN("Combo settings index %d exceeds pool size %d", idx, COMBO_POOL_SIZE);
+            return -EINVAL;
+        }
+        if (len > sizeof(struct zmk_combo_setting)) {
+            LOG_ERR("Combo setting too large (got %d, max %d)", (int)len,
+                    (int)sizeof(struct zmk_combo_setting));
+            return -EINVAL;
+        }
+
+        struct zmk_combo_setting rec = {0};
+        int err = read_cb(cb_arg, &rec, len);
+        if (err <= 0) {
+            LOG_ERR("Failed to read combo %d from settings (%d)", idx, err);
+            return err;
+        }
+
+        if (rec.key_position_len == 0) {
+            // Tombstone: a deleted stock combo (see zmk_combos_save_changes).
+            // Override the stock reseed by emptying the slot.
+            combos[idx] = (struct combo_cfg){0};
+            combo_used[idx] = false;
+            return 0;
+        }
+
+        const char *behavior_name =
+            zmk_behavior_find_behavior_name_from_local_id(rec.behavior_local_id);
+        if (!behavior_name) {
+            LOG_WRN("Loaded combo %d but no behavior found for local id %d", idx,
+                    rec.behavior_local_id);
+        }
+
+        struct combo_cfg cfg = {
+            .key_position_len = rec.key_position_len,
+            .slow_release = rec.slow_release != 0,
+            .require_prior_idle_ms = rec.require_prior_idle_ms,
+            .timeout_ms = rec.timeout_ms,
+            .layer_mask = rec.layer_mask,
+            .behavior =
+                (struct zmk_behavior_binding){
+                    .behavior_dev = behavior_name,
+                    .param1 = rec.param1,
+                    .param2 = rec.param2,
+                },
+        };
+        int kp_count = MIN((int)rec.key_position_len, MAX_COMBO_KEYS);
+        for (int kp = 0; kp < kp_count; kp++) {
+            cfg.key_positions[kp] = rec.key_positions[kp];
+        }
+
+        // Mark the slot used (loaded values are persisted, not pending).
+        combos[idx] = cfg;
+        combo_used[idx] = true;
+    }
+
+    return 0;
+}
+
+static int combo_handle_commit(void) {
+    k_sched_lock();
+    rebuild_combo_lookup();
+    k_sched_unlock();
+    return 0;
+}
+
+SETTINGS_STATIC_HANDLER_DEFINE(combos, "combos", NULL, combo_handle_set, combo_handle_commit, NULL);
 
 #else
 
@@ -713,13 +990,28 @@ int zmk_combos_set(uint16_t idx, const struct zmk_combo *combo) {
     return -ENOTSUP;
 }
 
+int zmk_combos_add(const struct zmk_combo *combo) {
+    ARG_UNUSED(combo);
+    return -ENOTSUP;
+}
+
+int zmk_combos_remove(uint16_t idx) {
+    ARG_UNUSED(idx);
+    return -ENOTSUP;
+}
+
+int zmk_combos_check_unsaved_changes(void) { return 0; }
+int zmk_combos_save_changes(void) { return -ENOTSUP; }
+int zmk_combos_discard_changes(void) { return -ENOTSUP; }
+int zmk_combos_reset_settings(void) { return -ENOTSUP; }
+
 #endif // CONFIG_ZMK_COMBO_RUNTIME_EDITING
 
-#else // !DT_HAS_COMPAT_STATUS_OKAY(zmk_combos)
+#else // !HAS_DT_COMBOS && !CONFIG_ZMK_COMBO_RUNTIME_EDITING
 
-// No combos defined in devicetree: keep the read API linkable for the Studio
-// combo subsystem (which is compiled whenever CONFIG_ZMK_STUDIO_RPC is on).
-// Runtime add (zero-DT build) lands in M4.
+// Neither devicetree combos nor runtime editing: keep the read API linkable for
+// the Studio combo subsystem (compiled whenever CONFIG_ZMK_STUDIO_RPC is on).
+// With runtime editing enabled the zero-DT pool lives in the block above instead.
 size_t zmk_combos_get_count(void) { return 0; }
 
 size_t zmk_combos_get_capacity(void) { return 0; }
@@ -737,5 +1029,20 @@ int zmk_combos_set(uint16_t idx, const struct zmk_combo *combo) {
     ARG_UNUSED(combo);
     return -ENOTSUP;
 }
+
+int zmk_combos_add(const struct zmk_combo *combo) {
+    ARG_UNUSED(combo);
+    return -ENOTSUP;
+}
+
+int zmk_combos_remove(uint16_t idx) {
+    ARG_UNUSED(idx);
+    return -ENOTSUP;
+}
+
+int zmk_combos_check_unsaved_changes(void) { return 0; }
+int zmk_combos_save_changes(void) { return -ENOTSUP; }
+int zmk_combos_discard_changes(void) { return -ENOTSUP; }
+int zmk_combos_reset_settings(void) { return -ENOTSUP; }
 
 #endif
