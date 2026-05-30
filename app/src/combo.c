@@ -43,7 +43,17 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define COMBOS_KEYS_BYTE_ARRAY(node_id)                                                            \
     uint8_t _CONCAT(combo_prop_, node_id)[DT_PROP_LEN(node_id, key_positions)];
 
-#define MAX_COMBO_KEYS sizeof(union {DT_INST_FOREACH_CHILD(0, COMBOS_KEYS_BYTE_ARRAY)})
+#define DT_MAX_COMBO_KEYS sizeof(union {DT_INST_FOREACH_CHILD(0, COMBOS_KEYS_BYTE_ARRAY)})
+
+// Effective per-combo key capacity, used to size combo_cfg/active_combo storage.
+// With runtime editing on, users can create combos with more keys than any
+// devicetree combo, so widen the devicetree-derived maximum to the runtime
+// Kconfig (A1).
+#if IS_ENABLED(CONFIG_ZMK_COMBO_RUNTIME_EDITING)
+#define MAX_COMBO_KEYS MAX(DT_MAX_COMBO_KEYS, CONFIG_ZMK_COMBO_MAX_KEYS_PER_COMBO_RUNTIME)
+#else
+#define MAX_COMBO_KEYS DT_MAX_COMBO_KEYS
+#endif
 
 struct combo_cfg {
     int32_t key_positions[MAX_COMBO_KEYS];
@@ -97,15 +107,37 @@ struct active_combo {
 // Doing so allows our bitmasks to be "shorted key positions list first" when searching for matches.
 // `20` is chosen as a reasonable limit, since the theoretical maximum number of keys you might
 // reasonably press simultaneously with 10 fingers is 20 keys, two keys per finger.
-static const struct combo_cfg combos[] = {
-    LISTIFY(20, COMBO_CONFIGS_WITH_MATCHING_POSITIONS_LEN, (), 0)};
-
 #define COMBO_ONE(n) +1
 
 #define COMBO_CHILDREN_COUNT (0 DT_INST_FOREACH_CHILD(0, COMBO_ONE))
 
+#if IS_ENABLED(CONFIG_ZMK_COMBO_RUNTIME_EDITING)
+
+// Runtime-editable bounded pool. combo_stock keeps the devicetree defaults (for
+// discard/reset, M3); combos[] is the mutable working set, seeded from it at
+// init. combo_used marks which pool slots are live. The pool index is the
+// combo's stable identity: == ZMK_VIRTUAL_KEY_POSITION_COMBO arg, == NVS key
+// (M3), == active_combos[].combo_idx. Slots are never compacted; empty slots
+// simply have no combo_lookup bit set, so the match loops never select them.
+#define COMBO_POOL_SIZE CONFIG_ZMK_COMBO_MAX_COMBOS
+
+static const struct combo_cfg combo_stock[] = {
+    LISTIFY(20, COMBO_CONFIGS_WITH_MATCHING_POSITIONS_LEN, (), 0)};
+
+static struct combo_cfg combos[COMBO_POOL_SIZE];
+static bool combo_used[COMBO_POOL_SIZE];
+
+#else
+
+#define COMBO_POOL_SIZE COMBO_CHILDREN_COUNT
+
+static const struct combo_cfg combos[] = {
+    LISTIFY(20, COMBO_CONFIGS_WITH_MATCHING_POSITIONS_LEN, (), 0)};
+
+#endif // CONFIG_ZMK_COMBO_RUNTIME_EDITING
+
 // We need at least 4 bytes to avoid alignment issues
-#define BYTES_FOR_COMBOS_MASK DIV_ROUND_UP(COMBO_CHILDREN_COUNT, 32)
+#define BYTES_FOR_COMBOS_MASK DIV_ROUND_UP(COMBO_POOL_SIZE, 32)
 
 uint8_t pressed_keys_count = 0;
 // set of keys pressed
@@ -435,19 +467,32 @@ static int position_state_down(const zmk_event_t *ev, struct zmk_position_state_
     update_timeout_task();
 
     if (num_candidates) {
+        // Select the shortest completely-pressed combo (lowest index breaks
+        // ties). The legacy code relied on the combos array being grouped
+        // shortest-first and just took the first candidate bit. The runtime
+        // pool can't preserve that ordering, so we scan all candidates and pick
+        // by key_position_len explicitly - otherwise a shorter, fully-pressed
+        // combo sitting at a higher slot index would be skipped.
+        int best = -1;
         for (int i = 0; i < ARRAY_SIZE(combos); i++) {
-            if (sys_bitfield_test_bit((mem_addr_t)&candidates, i)) {
-                const struct combo_cfg *candidate_combo = &combos[i];
-                if (candidate_is_completely_pressed(candidate_combo)) {
-                    fully_pressed_combo = i;
-                    if (num_candidates == 1) {
-                        cleanup();
-                    }
-                }
-
-                return ret;
+            if (!sys_bitfield_test_bit((mem_addr_t)&candidates, i)) {
+                continue;
+            }
+            const struct combo_cfg *candidate_combo = &combos[i];
+            if (candidate_is_completely_pressed(candidate_combo) &&
+                (best < 0 || candidate_combo->key_position_len < combos[best].key_position_len)) {
+                best = i;
             }
         }
+
+        if (best >= 0) {
+            fully_pressed_combo = best;
+            if (num_candidates == 1) {
+                cleanup();
+            }
+        }
+
+        return ret;
     } else {
         cleanup();
         return ret;
@@ -520,28 +565,82 @@ ZMK_LISTENER(combo, behavior_combo_listener);
 ZMK_SUBSCRIPTION(combo, zmk_position_state_changed);
 ZMK_SUBSCRIPTION(combo, zmk_keycode_state_changed);
 
+#if IS_ENABLED(CONFIG_ZMK_COMBO_RUNTIME_EDITING)
+
+// Rebuild the whole key-position -> combos lookup table from the used pool
+// slots. Cold path (only on init and after an edit), so a full rebuild is fine.
+// Callers must hold k_sched_lock so the match loops never observe a partially
+// cleared table.
+static void rebuild_combo_lookup(void) {
+    memset(combo_lookup, 0, sizeof(combo_lookup));
+    for (size_t i = 0; i < COMBO_POOL_SIZE; i++) {
+        if (combo_used[i]) {
+            initialize_combo(i);
+        }
+    }
+}
+
+// If pool slot idx is currently a pressed (active) combo, force-release its
+// behavior against the OLD definition and free the active-combo entry before
+// the slot is mutated. Invokes a behavior, so it runs outside k_sched_lock.
+static void release_active_combo_if_present(uint16_t idx) {
+    for (int i = 0; i < active_combo_count; i++) {
+        if (active_combos[i].combo_idx == idx) {
+            release_combo_behavior(idx, &combos[idx], k_uptime_get());
+            deactivate_combo(i);
+            return;
+        }
+    }
+}
+
+#endif // CONFIG_ZMK_COMBO_RUNTIME_EDITING
+
 static int combo_init(void) {
     for (size_t i = 0; i < CONFIG_ZMK_COMBO_MAX_PRESSED_COMBOS; i++) {
         active_combos[i].combo_idx = UINT16_MAX;
     }
 
     k_work_init_delayable(&timeout_task, combo_timeout_handler);
+
+#if IS_ENABLED(CONFIG_ZMK_COMBO_RUNTIME_EDITING)
+    // Seed the mutable pool from the devicetree defaults.
+    for (size_t i = 0; i < ARRAY_SIZE(combo_stock); i++) {
+        combos[i] = combo_stock[i];
+        combo_used[i] = true;
+    }
+    LOG_WRN("Have %d combos (pool size %d)!", (int)ARRAY_SIZE(combo_stock), COMBO_POOL_SIZE);
+    k_sched_lock();
+    rebuild_combo_lookup();
+    k_sched_unlock();
+#else
     LOG_WRN("Have %d combos!", ARRAY_SIZE(combos));
     for (int i = 0; i < ARRAY_SIZE(combos); i++) {
         initialize_combo(i);
     }
+#endif
     return 0;
 }
 
 SYS_INIT(combo_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
 
-// Read-only public accessors (M1). M2 widens these to the mutable pool + writers.
-size_t zmk_combos_get_count(void) { return ARRAY_SIZE(combos); }
+// Public accessors. With runtime editing on, "count" is the pool capacity and
+// callers skip empty slots via the -ENOENT return from zmk_combos_get.
+size_t zmk_combos_get_count(void) { return COMBO_POOL_SIZE; }
+
+size_t zmk_combos_get_capacity(void) { return COMBO_POOL_SIZE; }
+
+size_t zmk_combos_get_max_keys(void) { return MIN((size_t)MAX_COMBO_KEYS, (size_t)ZMK_COMBO_MAX_KEYS); }
 
 int zmk_combos_get(uint16_t idx, struct zmk_combo *out) {
-    if (idx >= ARRAY_SIZE(combos)) {
+    if (idx >= COMBO_POOL_SIZE) {
         return -EINVAL;
     }
+
+#if IS_ENABLED(CONFIG_ZMK_COMBO_RUNTIME_EDITING)
+    if (!combo_used[idx]) {
+        return -ENOENT;
+    }
+#endif
 
     const struct combo_cfg *c = &combos[idx];
 
@@ -558,16 +657,85 @@ int zmk_combos_get(uint16_t idx, struct zmk_combo *out) {
     return 0;
 }
 
+#if IS_ENABLED(CONFIG_ZMK_COMBO_RUNTIME_EDITING)
+
+int zmk_combos_set(uint16_t idx, const struct zmk_combo *combo) {
+    if (idx >= COMBO_POOL_SIZE) {
+        return -EINVAL;
+    }
+
+    if (combo->key_position_len < 1 || combo->key_position_len > zmk_combos_get_max_keys()) {
+        LOG_WRN("Rejecting combo %d: key count %d out of range", idx, combo->key_position_len);
+        return -EINVAL;
+    }
+
+    for (int i = 0; i < combo->key_position_len; i++) {
+        if (combo->key_positions[i] < 0 || combo->key_positions[i] >= ZMK_KEYMAP_LEN) {
+            LOG_WRN("Rejecting combo %d: key position %d out of range", idx,
+                    combo->key_positions[i]);
+            return -EINVAL;
+        }
+    }
+
+    // The binding itself is validated by the RPC layer (zmk_behavior_validate_binding)
+    // before this is called, mirroring the keymap set path.
+
+    struct combo_cfg cfg = {
+        .timeout_ms = combo->timeout_ms,
+        .require_prior_idle_ms = combo->require_prior_idle_ms,
+        .key_position_len = combo->key_position_len,
+        .layer_mask = combo->layer_mask,
+        .slow_release = combo->slow_release,
+        .behavior = combo->behavior,
+    };
+    for (int i = 0; i < combo->key_position_len; i++) {
+        cfg.key_positions[i] = combo->key_positions[i];
+    }
+
+    // Clean up any in-flight press of this slot against its old definition
+    // before swapping it out (invokes a behavior, so do it before locking).
+    release_active_combo_if_present(idx);
+
+    k_sched_lock();
+    combos[idx] = cfg;
+    combo_used[idx] = true;
+    rebuild_combo_lookup();
+    k_sched_unlock();
+
+    return 0;
+}
+
+#else
+
+int zmk_combos_set(uint16_t idx, const struct zmk_combo *combo) {
+    ARG_UNUSED(idx);
+    ARG_UNUSED(combo);
+    return -ENOTSUP;
+}
+
+#endif // CONFIG_ZMK_COMBO_RUNTIME_EDITING
+
 #else // !DT_HAS_COMPAT_STATUS_OKAY(zmk_combos)
 
 // No combos defined in devicetree: keep the read API linkable for the Studio
 // combo subsystem (which is compiled whenever CONFIG_ZMK_STUDIO_RPC is on).
+// Runtime add (zero-DT build) lands in M4.
 size_t zmk_combos_get_count(void) { return 0; }
+
+size_t zmk_combos_get_capacity(void) { return 0; }
+
+size_t zmk_combos_get_max_keys(void) { return ZMK_COMBO_MAX_KEYS; }
 
 int zmk_combos_get(uint16_t idx, struct zmk_combo *out) {
     ARG_UNUSED(idx);
     ARG_UNUSED(out);
     return -EINVAL;
+}
+
+int zmk_combos_set(uint16_t idx, const struct zmk_combo *combo) {
+    ARG_UNUSED(idx);
+    ARG_UNUSED(combo);
+    return -ENOTSUP;
 }
 
 #endif

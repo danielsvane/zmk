@@ -103,6 +103,13 @@ config ZMK_STUDIO_RPC_THREAD_STACK_SIZE
 
 config ZMK_STUDIO_RPC_RX_BUF_SIZE
     int "RX Buffer Size"
+    # Combo edit/add requests carry a Combo message (packed key_positions array
+    # plus several varints, e.g. require_prior_idle_ms = -1 encodes as 10 bytes),
+    # far larger than any keymap request. The RX ring buffer must hold a whole
+    # request or the transport drops the overflow and pb_decode blocks forever on
+    # the truncated message. 30 bytes is fine for stock Studio but not for
+    # runtime combo editing.
+    default 256 if ZMK_COMBO_RUNTIME_EDITING
     default 30
 
 config ZMK_STUDIO_RPC_TX_BUF_SIZE

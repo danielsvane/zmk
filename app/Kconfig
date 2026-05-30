@@ -451,6 +451,35 @@ config ZMK_COMBO_MAX_PRESSED_COMBOS
     int "Maximum number of currently pressed combos"
     default 4
 
+config ZMK_COMBO_RUNTIME_EDITING
+    bool "Runtime combo editing (ZMK Studio)"
+    default y if ZMK_STUDIO_RPC
+    help
+      Replace the compile-time combo array with a mutable bounded pool so combos
+      can be created, edited and deleted at runtime over the Studio RPC protocol.
+      (NVS persistence is added separately - see ZMK_KEYMAP_SETTINGS_STORAGE.)
+
+if ZMK_COMBO_RUNTIME_EDITING
+
+config ZMK_COMBO_MAX_COMBOS
+    int "Runtime combo pool size"
+    default 64
+    help
+      Number of slots in the runtime combo pool. Each slot has a stable pool
+      index used as its virtual key position and (later) NVS key, so this also
+      bounds the combo virtual-key-position block (see ZMK_COMBOS_LEN).
+
+config ZMK_COMBO_MAX_KEYS_PER_COMBO_RUNTIME
+    int "Max key positions per runtime-editable combo"
+    default 4
+    help
+      Effective max keys per combo is MAX(this, the devicetree-derived count).
+      Needed because the devicetree-derived maximum is 0 when no combos are
+      defined in devicetree (the common Studio case). Do not confuse with the
+      deprecated ZMK_COMBO_MAX_KEYS_PER_COMBO.
+
+endif # ZMK_COMBO_RUNTIME_EDITING
+
 config ZMK_COMBO_MAX_COMBOS_PER_KEY
     int "Deprecated: Max combos per key"
     default 0
