@@ -347,10 +347,32 @@ static int rtbeh_set(const char *name, size_t len, settings_read_cb read_cb, voi
     return 0;
 }
 
-// Settings commit runs after every subsystem's `set` callbacks. M7 will use this
-// to re-resolve persisted sub-binding local_ids on a cold boot; in M6 the pool's
-// own visibility is driven entirely by state->active (set above), so there is
-// nothing to do here yet.
+// Settings commit runs after every subsystem's `set` callbacks, i.e. after the
+// behavior local-id table has finished loading. This is where combos re-resolves
+// a runtime combo's stored sub-binding local_id -> behavior_dev (combo.c
+// a644b8b / combo_handle_commit), because the combo record can load before the
+// local-id table on a cold boot and the set-time resolution would otherwise be
+// lost with no retry.
+//
+// M7 (cold-boot) verified that the runtime-behaviour pool does NOT have that
+// hazard for its CURRENT descriptor, so there is nothing to re-resolve here yet:
+//   - Slot config is restored by rtbeh_set keyed on POOL INDEX, so it is
+//     order-independent of the local-id table (the very reason for index keying).
+//   - The slot's own findability as a binding target rides on the EXISTING
+//     keymap/combo commit re-resolution: the pool slot is a compile-time DT
+//     device with a stable local_id (LOCAL_ID_TYPE_SETTINGS_TABLE), and a keymap
+//     or combo that binds it stores it by local_id and re-resolves it in its own
+//     commit. Our handler restores only state->active + name + scalar config.
+//   - hold-tap's hold/tap sub-bindings are fixed DT device-name strings
+//     (DEVICE_DT_NAME of the phandles), not stored local_ids, so they need no
+//     re-resolution.
+//
+// The combos-style re-resolution loop belongs here once M9 makes the hold/tap
+// sub-bindings editable: that adds a BEHAVIOR_REF-typed descriptor field whose
+// value is persisted as a behavior_local_id, and this commit_cb must then walk
+// active slots' descriptor fields and resolve each stored local_id ->
+// behavior_dev (mirroring combo_handle_commit), since those records can load
+// before the local-id table.
 static int rtbeh_commit(void) { return 0; }
 
 SETTINGS_STATIC_HANDLER_DEFINE(rtbeh, RTBEH_SETTINGS_SUBTREE, NULL, rtbeh_set, rtbeh_commit, NULL);
