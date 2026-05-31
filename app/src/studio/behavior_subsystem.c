@@ -532,6 +532,15 @@ zmk_studio_Response set_custom_behavior(const zmk_studio_Request *req) {
         }
     }
 
+    // Optional rename (M9). The display name is per-slot mutable RAM state
+    // (persisted in the NVS record header), not a config field, so it lives
+    // outside the descriptor loop. Absent (has_display_name == false) leaves the
+    // current name untouched, so a config-only set never clobbers the name.
+    if (set_req->has_display_name) {
+        strncpy(slot->state->name, set_req->display_name, sizeof(slot->state->name) - 1);
+        slot->state->name[sizeof(slot->state->name) - 1] = '\0';
+    }
+
     // The edit is RAM-only until saved (M6); flag it so the Studio header shows
     // unsaved changes and save_changes persists this slot.
     zmk_behavior_runtime_mark_dirty(set_req->id);
