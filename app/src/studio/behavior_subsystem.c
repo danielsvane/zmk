@@ -18,9 +18,43 @@ ZMK_RPC_SUBSYSTEM(behaviors)
 
 #define BEHAVIOR_RESPONSE(type, ...) ZMK_RPC_RESPONSE(behaviors, type, __VA_ARGS__)
 
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING)
+// Locate a runtime pool slot by its device's stable local_id, or by device.
+static const struct zmk_behavior_runtime_slot *find_runtime_slot(uint32_t local_id) {
+    STRUCT_SECTION_FOREACH(zmk_behavior_runtime_slot, slot) {
+        if (zmk_behavior_get_local_id(slot->dev->name) == local_id) {
+            return slot;
+        }
+    }
+    return NULL;
+}
+
+static const struct zmk_behavior_runtime_slot *runtime_slot_for_device(const struct device *dev) {
+    STRUCT_SECTION_FOREACH(zmk_behavior_runtime_slot, slot) {
+        if (slot->dev == dev) {
+            return slot;
+        }
+    }
+    return NULL;
+}
+
+// An unclaimed pool slot is hidden from list_all_behaviors (and so isn't
+// selectable as a binding) until add_custom_behavior turns it into a real
+// behaviour (M4). Built-in (non-pool) behaviours are never hidden.
+static bool runtime_local_id_hidden(uint32_t local_id) {
+    const struct zmk_behavior_runtime_slot *slot = find_runtime_slot(local_id);
+    return slot && !slot->state->active;
+}
+#endif // IS_ENABLED(CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING)
+
 static bool encode_behavior_summaries(pb_ostream_t *stream, const pb_field_t *field,
                                       void *const *arg) {
     STRUCT_SECTION_FOREACH(zmk_behavior_local_id_map, beh) {
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING)
+        if (runtime_local_id_hidden(beh->local_id)) {
+            continue;
+        }
+#endif
         if (!pb_encode_tag_for_field(stream, field)) {
             return false;
         }
@@ -154,13 +188,13 @@ static bool encode_metadata_sets(pb_ostream_t *stream, const pb_field_t *field, 
 }
 
 static bool encode_behavior_name(pb_ostream_t *stream, const pb_field_t *field, void *const *arg) {
-    struct zmk_behavior_ref *zbm = (struct zmk_behavior_ref *)*arg;
+    const char *name = (const char *)*arg;
 
     if (!pb_encode_tag_for_field(stream, field)) {
         return false;
     }
 
-    return pb_encode_string(stream, zbm->metadata.display_name, strlen(zbm->metadata.display_name));
+    return pb_encode_string(stream, name, strlen(name));
 }
 
 static struct encode_metadata_sets_state state = {};
@@ -196,11 +230,21 @@ zmk_studio_Response get_behavior_details(const zmk_studio_Request *req) {
         LOG_DBG("Got metadata with %d sets", desc.sets_len);
     }
 
+    // A claimed runtime slot shows its user-given name; everything else uses the
+    // const DT metadata name.
+    const char *display_name = zbm->metadata.display_name;
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING)
+    const struct zmk_behavior_runtime_slot *rt_slot = runtime_slot_for_device(device);
+    if (rt_slot && rt_slot->state->active && rt_slot->state->name[0]) {
+        display_name = rt_slot->state->name;
+    }
+#endif
+
     zmk_behaviors_GetBehaviorDetailsResponse resp =
         zmk_behaviors_GetBehaviorDetailsResponse_init_zero;
     resp.id = behavior_id;
     resp.display_name.funcs.encode = encode_behavior_name;
-    resp.display_name.arg = zbm;
+    resp.display_name.arg = (void *)display_name;
 
     state.sets = desc.sets;
     state.sets_len = desc.sets_len;
@@ -298,34 +342,50 @@ static bool encode_config_fields(pb_ostream_t *stream, const pb_field_t *field,
     return true;
 }
 
-// The runtime slot's display name comes from the behaviour metadata (DT
-// display-name), matching get_behavior_details; falls back to the device name.
-static const char *runtime_slot_display_name(const struct device *dev) {
+// A claimed slot shows its user-given name; otherwise the DT metadata name (the
+// "Spare Hold-Tap N" label), falling back to the raw device name.
+static const char *runtime_slot_display_name(const struct zmk_behavior_runtime_slot *slot) {
+    if (slot->state->name[0]) {
+        return slot->state->name;
+    }
 #if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_METADATA)
     STRUCT_SECTION_FOREACH(zmk_behavior_ref, ref) {
-        if (ref->device == dev) {
+        if (ref->device == slot->dev) {
             return ref->metadata.display_name;
         }
     }
 #endif
-    return dev->name;
+    return slot->dev->name;
 }
 
-// Encodes CustomBehaviors.behaviors — one CustomBehavior per runtime pool slot.
+// Populate a wire CustomBehavior from a pool slot. `config` is a callback whose
+// arg is the (static, ROM) slot, so this is safe to use both inside the
+// get_custom_behaviors encode and in the add_custom_behavior OK response.
+static void fill_custom_behavior(zmk_behaviors_CustomBehavior *beh,
+                                 const struct zmk_behavior_runtime_slot *slot) {
+    *beh = (zmk_behaviors_CustomBehavior)zmk_behaviors_CustomBehavior_init_zero;
+    beh->id = zmk_behavior_get_local_id(slot->dev->name);
+    strncpy(beh->display_name, runtime_slot_display_name(slot), sizeof(beh->display_name) - 1);
+    strncpy(beh->kind, slot->desc->kind, sizeof(beh->kind) - 1);
+    beh->config.funcs.encode = encode_config_fields;
+    beh->config.arg = (void *)slot;
+}
+
+// Encodes CustomBehaviors.behaviors — one CustomBehavior per CLAIMED pool slot.
+// Unclaimed spares are hidden until add_custom_behavior claims them (M4).
 static bool encode_custom_behaviors(pb_ostream_t *stream, const pb_field_t *field,
                                     void *const *arg) {
     STRUCT_SECTION_FOREACH(zmk_behavior_runtime_slot, slot) {
+        if (!slot->state->active) {
+            continue;
+        }
+
         if (!pb_encode_tag_for_field(stream, field)) {
             return false;
         }
 
-        zmk_behaviors_CustomBehavior beh = zmk_behaviors_CustomBehavior_init_zero;
-        beh.id = zmk_behavior_get_local_id(slot->dev->name);
-        strncpy(beh.display_name, runtime_slot_display_name(slot->dev),
-                sizeof(beh.display_name) - 1);
-        strncpy(beh.kind, slot->desc->kind, sizeof(beh.kind) - 1);
-        beh.config.funcs.encode = encode_config_fields;
-        beh.config.arg = (void *)slot;
+        zmk_behaviors_CustomBehavior beh;
+        fill_custom_behavior(&beh, slot);
 
         if (!pb_encode_submessage(stream, &zmk_behaviors_CustomBehavior_msg, &beh)) {
             LOG_WRN("Failed to encode custom behaviour submessage");
@@ -359,15 +419,6 @@ zmk_studio_Response get_custom_behaviors(const zmk_studio_Request *req) {
 // names a kind, so adding a kind (M10) needs no change here. The driver reads
 // dev->config on every press, so edits take effect live. RAM-only until M6.
 // ---------------------------------------------------------------------------
-
-static const struct zmk_behavior_runtime_slot *find_runtime_slot(uint32_t local_id) {
-    STRUCT_SECTION_FOREACH(zmk_behavior_runtime_slot, slot) {
-        if (zmk_behavior_get_local_id(slot->dev->name) == local_id) {
-            return slot;
-        }
-    }
-    return NULL;
-}
 
 static const struct zmk_behavior_runtime_field *
 find_desc_field(const struct zmk_behavior_runtime_descriptor *desc, const char *key) {
@@ -455,6 +506,75 @@ zmk_studio_Response set_custom_behavior(const zmk_studio_Request *req) {
                              zmk_behaviors_SetCustomBehaviorResponse_SET_CUSTOM_BEHAVIOR_RESP_OK);
 }
 
+// ---------------------------------------------------------------------------
+// add_custom_behavior — claim a free spare slot of the requested kind, turning
+// it into a real behaviour (M4: RAM-only). We find the first unclaimed slot
+// whose descriptor kind matches `kind`, validate the seed config atomically
+// (reusing the set path's per-field validate/apply), then mark it active, set
+// its display name, and apply the seed config. The newly-claimed slot starts
+// appearing in list_all_behaviors (so it's selectable as a binding) and in
+// get_custom_behaviors. Still kind-agnostic: no behaviour family is named here.
+// ---------------------------------------------------------------------------
+
+zmk_studio_Response add_custom_behavior(const zmk_studio_Request *req) {
+    const zmk_behaviors_AddCustomBehaviorRequest *add_req =
+        &req->subsystem.behaviors.request_type.add_custom_behavior;
+
+    LOG_DBG("kind %s, name %s, %d fields", add_req->kind, add_req->display_name,
+            (int)add_req->config_count);
+
+    zmk_behaviors_AddCustomBehaviorResponse resp =
+        zmk_behaviors_AddCustomBehaviorResponse_init_zero;
+    resp.which_result = zmk_behaviors_AddCustomBehaviorResponse_err_tag;
+
+    // Find the first free pool slot of the requested kind.
+    const struct zmk_behavior_runtime_slot *slot = NULL;
+    STRUCT_SECTION_FOREACH(zmk_behavior_runtime_slot, s) {
+        if (!s->state->active && strcmp(s->desc->kind, add_req->kind) == 0) {
+            slot = s;
+            break;
+        }
+    }
+    if (!slot) {
+        LOG_WRN("No free runtime slot for kind %s", add_req->kind);
+        resp.result.err = zmk_behaviors_AddCustomBehaviorErrorCode_ADD_CUSTOM_BEHAVIOR_ERR_NO_SPACE;
+        return BEHAVIOR_RESPONSE(add_custom_behavior, resp);
+    }
+
+    // Validate the seed config before mutating anything (atomic claim).
+    for (size_t i = 0; i < add_req->config_count; i++) {
+        const zmk_behaviors_ConfigField *cf = &add_req->config[i];
+        const struct zmk_behavior_runtime_field *f = find_desc_field(slot->desc, cf->key);
+        if (f && !config_field_valid(f, cf)) {
+            LOG_WRN("Invalid seed value for field %s", cf->key);
+            resp.result.err =
+                zmk_behaviors_AddCustomBehaviorErrorCode_ADD_CUSTOM_BEHAVIOR_ERR_INVALID_PARAMETERS;
+            return BEHAVIOR_RESPONSE(add_custom_behavior, resp);
+        }
+    }
+
+    // Claim: mark active, set the display name, apply the seed config into the
+    // slot's RAM config (omitted fields keep their DT-seeded defaults).
+    slot->state->active = true;
+    strncpy(slot->state->name, add_req->display_name, sizeof(slot->state->name) - 1);
+    slot->state->name[sizeof(slot->state->name) - 1] = '\0';
+
+    for (size_t i = 0; i < add_req->config_count; i++) {
+        const zmk_behaviors_ConfigField *cf = &add_req->config[i];
+        const struct zmk_behavior_runtime_field *f = find_desc_field(slot->desc, cf->key);
+        if (f) {
+            apply_config_field(f, slot->config, cf);
+        }
+    }
+
+    resp.which_result = zmk_behaviors_AddCustomBehaviorResponse_ok_tag;
+    resp.result.ok.id = zmk_behavior_get_local_id(slot->dev->name);
+    resp.result.ok.has_behavior = true;
+    fill_custom_behavior(&resp.result.ok.behavior, slot);
+
+    return BEHAVIOR_RESPONSE(add_custom_behavior, resp);
+}
+
 #else // !CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING
 
 zmk_studio_Response get_custom_behaviors(const zmk_studio_Request *req) {
@@ -470,9 +590,19 @@ zmk_studio_Response set_custom_behavior(const zmk_studio_Request *req) {
         zmk_behaviors_SetCustomBehaviorResponse_SET_CUSTOM_BEHAVIOR_RESP_NOT_FOUND);
 }
 
+zmk_studio_Response add_custom_behavior(const zmk_studio_Request *req) {
+    LOG_DBG("");
+    zmk_behaviors_AddCustomBehaviorResponse resp =
+        zmk_behaviors_AddCustomBehaviorResponse_init_zero;
+    resp.which_result = zmk_behaviors_AddCustomBehaviorResponse_err_tag;
+    resp.result.err = zmk_behaviors_AddCustomBehaviorErrorCode_ADD_CUSTOM_BEHAVIOR_ERR_NO_SPACE;
+    return BEHAVIOR_RESPONSE(add_custom_behavior, resp);
+}
+
 #endif // IS_ENABLED(CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING)
 
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, list_all_behaviors, ZMK_STUDIO_RPC_HANDLER_UNSECURED);
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, get_behavior_details, ZMK_STUDIO_RPC_HANDLER_SECURED);
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, get_custom_behaviors, ZMK_STUDIO_RPC_HANDLER_SECURED);
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, set_custom_behavior, ZMK_STUDIO_RPC_HANDLER_SECURED);
+ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, add_custom_behavior, ZMK_STUDIO_RPC_HANDLER_SECURED);

@@ -60,17 +60,33 @@ struct zmk_behavior_runtime_descriptor {
     size_t fields_len;
 };
 
+/** Capacity (including the null terminator) of a slot's mutable display name —
+ * matches the proto CustomBehavior.display_name max_size. */
+#define ZMK_BEHAVIOR_RUNTIME_NAME_SIZE 48
+
+/** Per-slot mutable RAM state. The slot struct itself is const (ROM), so the
+ * bits that change at runtime — whether the slot has been claimed as a real
+ * behaviour (M4), and its user-given display name — live here. */
+struct zmk_behavior_runtime_state {
+    bool active;                              // claimed via add_custom_behavior?
+    char name[ZMK_BEHAVIOR_RUNTIME_NAME_SIZE]; // user display name (empty until claimed)
+};
+
 /** One runtime-editable pool slot: a spare device + its RAM config + descriptor. */
 struct zmk_behavior_runtime_slot {
     const struct device *dev; // the spare DT behaviour instance
     void *config;             // RAM config object for `dev` (kind-specific layout)
     const struct zmk_behavior_runtime_descriptor *desc;
+    struct zmk_behavior_runtime_state *state; // mutable per-slot RAM state
 };
 
-/** Register a pool slot into the iterable section walked by the Studio subsystem. */
+/** Register a pool slot into the iterable section walked by the Studio subsystem.
+ * Allocates the slot's mutable RAM state (claimed flag + name) alongside it. */
 #define ZMK_BEHAVIOR_RUNTIME_SLOT_DEFINE(name, _dev, _config, _desc)                                \
+    static struct zmk_behavior_runtime_state name##_state = {0};                                   \
     static const STRUCT_SECTION_ITERABLE(zmk_behavior_runtime_slot, name) = {                       \
         .dev = (_dev),                                                                              \
         .config = (_config),                                                                        \
         .desc = (_desc),                                                                            \
+        .state = &name##_state,                                                                     \
     }
