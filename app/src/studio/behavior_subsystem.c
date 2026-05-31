@@ -209,5 +209,16 @@ zmk_studio_Response get_behavior_details(const zmk_studio_Request *req) {
     return BEHAVIOR_RESPONSE(get_behavior_details, resp);
 }
 
+// M0 tracer: return an empty custom-behaviour pool. The repeated `behaviors`
+// field is a nanopb callback with no encode function set, so it encodes zero
+// entries. Later milestones populate it from the real spare-instance pool.
+zmk_studio_Response get_custom_behaviors(const zmk_studio_Request *req) {
+    LOG_DBG("");
+    zmk_behaviors_CustomBehaviors resp = zmk_behaviors_CustomBehaviors_init_zero;
+
+    return BEHAVIOR_RESPONSE(get_custom_behaviors, resp);
+}
+
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, list_all_behaviors, ZMK_STUDIO_RPC_HANDLER_UNSECURED);
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, get_behavior_details, ZMK_STUDIO_RPC_HANDLER_SECURED);
+ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, get_custom_behaviors, ZMK_STUDIO_RPC_HANDLER_SECURED);
