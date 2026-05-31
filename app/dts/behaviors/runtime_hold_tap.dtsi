@@ -28,6 +28,13 @@
             tapping-term-ms = <200>;
             quick-tap-ms = <0>;
             require-prior-idle-ms = <0>;
+            /* Placeholder: sizes the flexible hold_trigger_key_positions[] array
+             * to ZMK_BEHAVIOR_RUNTIME_POSITIONS_MAX (32) entries of RAM backing
+             * storage so a runtime edit can write up to that many positions. The
+             * driver resets the active length to 0 at boot (a fresh spare has no
+             * trigger positions); the count here must equal that capacity. */
+            hold-trigger-key-positions = <0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                                          0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0>;
             runtime-editable;
             display-name = "Spare Hold-Tap 1";
         };
@@ -39,6 +46,13 @@
             tapping-term-ms = <200>;
             quick-tap-ms = <0>;
             require-prior-idle-ms = <0>;
+            /* Placeholder: sizes the flexible hold_trigger_key_positions[] array
+             * to ZMK_BEHAVIOR_RUNTIME_POSITIONS_MAX (32) entries of RAM backing
+             * storage so a runtime edit can write up to that many positions. The
+             * driver resets the active length to 0 at boot (a fresh spare has no
+             * trigger positions); the count here must equal that capacity. */
+            hold-trigger-key-positions = <0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                                          0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0>;
             runtime-editable;
             display-name = "Spare Hold-Tap 2";
         };
@@ -50,6 +64,13 @@
             tapping-term-ms = <200>;
             quick-tap-ms = <0>;
             require-prior-idle-ms = <0>;
+            /* Placeholder: sizes the flexible hold_trigger_key_positions[] array
+             * to ZMK_BEHAVIOR_RUNTIME_POSITIONS_MAX (32) entries of RAM backing
+             * storage so a runtime edit can write up to that many positions. The
+             * driver resets the active length to 0 at boot (a fresh spare has no
+             * trigger positions); the count here must equal that capacity. */
+            hold-trigger-key-positions = <0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                                          0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0>;
             runtime-editable;
             display-name = "Spare Hold-Tap 3";
         };
@@ -61,6 +82,13 @@
             tapping-term-ms = <200>;
             quick-tap-ms = <0>;
             require-prior-idle-ms = <0>;
+            /* Placeholder: sizes the flexible hold_trigger_key_positions[] array
+             * to ZMK_BEHAVIOR_RUNTIME_POSITIONS_MAX (32) entries of RAM backing
+             * storage so a runtime edit can write up to that many positions. The
+             * driver resets the active length to 0 at boot (a fresh spare has no
+             * trigger positions); the count here must equal that capacity. */
+            hold-trigger-key-positions = <0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                                          0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0>;
             runtime-editable;
             display-name = "Spare Hold-Tap 4";
         };
@@ -72,6 +100,13 @@
             tapping-term-ms = <200>;
             quick-tap-ms = <0>;
             require-prior-idle-ms = <0>;
+            /* Placeholder: sizes the flexible hold_trigger_key_positions[] array
+             * to ZMK_BEHAVIOR_RUNTIME_POSITIONS_MAX (32) entries of RAM backing
+             * storage so a runtime edit can write up to that many positions. The
+             * driver resets the active length to 0 at boot (a fresh spare has no
+             * trigger positions); the count here must equal that capacity. */
+            hold-trigger-key-positions = <0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                                          0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0>;
             runtime-editable;
             display-name = "Spare Hold-Tap 5";
         };
@@ -83,6 +118,13 @@
             tapping-term-ms = <200>;
             quick-tap-ms = <0>;
             require-prior-idle-ms = <0>;
+            /* Placeholder: sizes the flexible hold_trigger_key_positions[] array
+             * to ZMK_BEHAVIOR_RUNTIME_POSITIONS_MAX (32) entries of RAM backing
+             * storage so a runtime edit can write up to that many positions. The
+             * driver resets the active length to 0 at boot (a fresh spare has no
+             * trigger positions); the count here must equal that capacity. */
+            hold-trigger-key-positions = <0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                                          0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0>;
             runtime-editable;
             display-name = "Spare Hold-Tap 6";
         };
@@ -94,6 +136,13 @@
             tapping-term-ms = <200>;
             quick-tap-ms = <0>;
             require-prior-idle-ms = <0>;
+            /* Placeholder: sizes the flexible hold_trigger_key_positions[] array
+             * to ZMK_BEHAVIOR_RUNTIME_POSITIONS_MAX (32) entries of RAM backing
+             * storage so a runtime edit can write up to that many positions. The
+             * driver resets the active length to 0 at boot (a fresh spare has no
+             * trigger positions); the count here must equal that capacity. */
+            hold-trigger-key-positions = <0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                                          0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0>;
             runtime-editable;
             display-name = "Spare Hold-Tap 7";
         };
@@ -105,6 +154,13 @@
             tapping-term-ms = <200>;
             quick-tap-ms = <0>;
             require-prior-idle-ms = <0>;
+            /* Placeholder: sizes the flexible hold_trigger_key_positions[] array
+             * to ZMK_BEHAVIOR_RUNTIME_POSITIONS_MAX (32) entries of RAM backing
+             * storage so a runtime edit can write up to that many positions. The
+             * driver resets the active length to 0 at boot (a fresh spare has no
+             * trigger positions); the count here must equal that capacity. */
+            hold-trigger-key-positions = <0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                                          0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0>;
             runtime-editable;
             display-name = "Spare Hold-Tap 8";
         };

@@ -31,10 +31,17 @@
 /** The C type of one editable config field, i.e. how to read/write it via its
  * struct offset and how it maps onto the proto ConfigValue/ConfigSchema oneof. */
 enum zmk_behavior_runtime_field_type {
-    ZMK_BEHAVIOR_RT_FIELD_INT,  // int (int-range schema)
-    ZMK_BEHAVIOR_RT_FIELD_ENUM, // enum stored as int (enum-options schema)
-    ZMK_BEHAVIOR_RT_FIELD_BOOL, // bool (bool schema)
+    ZMK_BEHAVIOR_RT_FIELD_INT,       // int (int-range schema)
+    ZMK_BEHAVIOR_RT_FIELD_ENUM,      // enum stored as int (enum-options schema)
+    ZMK_BEHAVIOR_RT_FIELD_BOOL,      // bool (bool schema)
+    ZMK_BEHAVIOR_RT_FIELD_POSITIONS, // int32_t[] + len (key-position-array schema)
 };
+
+/** Capacity of a runtime-editable key-position array. A pool slot's positions
+ * array is allocated at this length (the DT placeholder sizes the flexible array
+ * member), and this is the proto KeyPositions.positions max_count — they MUST
+ * match. Manicule54's hold-trigger-key-positions lists are ~24 long. */
+#define ZMK_BEHAVIOR_RUNTIME_POSITIONS_MAX 32
 
 /** Describes one editable config field of a behaviour kind: where it lives in
  * the kind's config struct, its wire key/label, and its constraints. */
@@ -51,6 +58,12 @@ struct zmk_behavior_runtime_field {
     // ENUM: option names; enum value is an index into this array.
     const char *const *enum_names;
     size_t enum_len;
+
+    // POSITIONS: `offset` points at the int32_t[] array; `len_offset` at its
+    // companion int32_t length member; `positions_max` is the array capacity
+    // (reported as the KeyPositionArray schema and enforced on decode).
+    size_t len_offset;
+    uint32_t positions_max;
 };
 
 /** A behaviour kind's full editable-config schema. */

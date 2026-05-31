@@ -946,6 +946,14 @@ static const struct zmk_behavior_runtime_field ht_fields[] = {
         .type = ZMK_BEHAVIOR_RT_FIELD_BOOL,
         .offset = offsetof(struct behavior_hold_tap_config, retro_tap),
     },
+    {
+        .key = "hold_trigger_key_positions",
+        .display_name = "Hold trigger key positions",
+        .type = ZMK_BEHAVIOR_RT_FIELD_POSITIONS,
+        .offset = offsetof(struct behavior_hold_tap_config, hold_trigger_key_positions),
+        .len_offset = offsetof(struct behavior_hold_tap_config, hold_trigger_key_positions_len),
+        .positions_max = ZMK_BEHAVIOR_RUNTIME_POSITIONS_MAX,
+    },
 };
 
 static const struct zmk_behavior_runtime_descriptor ht_descriptor = {
@@ -958,9 +966,21 @@ static const struct zmk_behavior_runtime_descriptor ht_descriptor = {
 // the DT defaults at load, so the Studio subsystem can read (M2) and mutate
 // (M3+) it in place — the driver reads dev->config on every press, so edits are
 // live. The instance is also registered as a runtime slot for the subsystem.
+// The DT placeholder (runtime_hold_tap.dtsi) sizes hold_trigger_key_positions[]
+// to its full capacity for RAM backing storage, which also sets _len to that
+// capacity. A freshly-booted spare has no trigger positions, so zero the active
+// length before the normal init runs; a runtime edit (set_custom_behavior) then
+// fills it in.
 #define KP_INST_RT(n)                                                                              \
     static struct behavior_hold_tap_config behavior_hold_tap_config_##n = HT_CFG_INIT(n);          \
-    HT_INST_COMMON(n)                                                                              \
+    static int behavior_hold_tap_rt_init_##n(const struct device *dev) {                            \
+        behavior_hold_tap_config_##n.hold_trigger_key_positions_len = 0;                            \
+        return behavior_hold_tap_init(dev);                                                         \
+    }                                                                                              \
+    static struct behavior_hold_tap_data behavior_hold_tap_data_##n = {};                          \
+    BEHAVIOR_DT_INST_DEFINE(n, behavior_hold_tap_rt_init_##n, NULL, &behavior_hold_tap_data_##n,    \
+                            &behavior_hold_tap_config_##n, POST_KERNEL,                             \
+                            CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, &behavior_hold_tap_driver_api);    \
     ZMK_BEHAVIOR_RUNTIME_SLOT_DEFINE(zmk_rt_slot_##n, DEVICE_DT_INST_GET(n),                        \
                                      &behavior_hold_tap_config_##n, &ht_descriptor);
 

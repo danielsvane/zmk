@@ -317,6 +317,20 @@ static void fill_config_field(zmk_behaviors_ConfigField *out,
         out->value.v.bool_value = v;
         break;
     }
+    case ZMK_BEHAVIOR_RT_FIELD_POSITIONS: {
+        int32_t len = *(const int32_t *)(base + f->len_offset);
+        const int32_t *arr = (const int32_t *)(base + f->offset);
+        zmk_behaviors_KeyPositions *kp = &out->value.v.positions;
+        out->schema.which_s = zmk_behaviors_ConfigSchema_positions_tag;
+        out->schema.s.positions.max = f->positions_max;
+        out->value.which_v = zmk_behaviors_ConfigValue_positions_tag;
+        size_t count = MIN((size_t)MAX(len, 0), ARRAY_SIZE(kp->positions));
+        kp->positions_count = count;
+        for (size_t i = 0; i < count; i++) {
+            kp->positions[i] = (uint32_t)arr[i];
+        }
+        break;
+    }
     }
 }
 
@@ -445,6 +459,9 @@ static bool config_field_valid(const struct zmk_behavior_runtime_field *f,
                cf->value.v.enum_value < f->enum_len;
     case ZMK_BEHAVIOR_RT_FIELD_BOOL:
         return cf->value.which_v == zmk_behaviors_ConfigValue_bool_value_tag;
+    case ZMK_BEHAVIOR_RT_FIELD_POSITIONS:
+        return cf->value.which_v == zmk_behaviors_ConfigValue_positions_tag &&
+               cf->value.v.positions.positions_count <= f->positions_max;
     }
     return false;
 }
@@ -463,6 +480,16 @@ static void apply_config_field(const struct zmk_behavior_runtime_field *f, void 
     case ZMK_BEHAVIOR_RT_FIELD_BOOL:
         *(bool *)(base + f->offset) = cf->value.v.bool_value;
         break;
+    case ZMK_BEHAVIOR_RT_FIELD_POSITIONS: {
+        const zmk_behaviors_KeyPositions *kp = &cf->value.v.positions;
+        int32_t *arr = (int32_t *)(base + f->offset);
+        // config_field_valid already bounded positions_count by positions_max.
+        for (size_t i = 0; i < kp->positions_count; i++) {
+            arr[i] = (int32_t)kp->positions[i];
+        }
+        *(int32_t *)(base + f->len_offset) = (int32_t)kp->positions_count;
+        break;
+    }
     }
 }
 
