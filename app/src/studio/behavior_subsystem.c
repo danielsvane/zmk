@@ -348,6 +348,113 @@ zmk_studio_Response get_custom_behaviors(const zmk_studio_Request *req) {
     return BEHAVIOR_RESPONSE(get_custom_behaviors, resp);
 }
 
+// ---------------------------------------------------------------------------
+// set_custom_behavior — the decode direction of the generic config round-trip.
+//
+// The request's `config` is a static nanopb array (see behaviors.options.in),
+// since requests are decoded without callbacks. We locate the target slot by its
+// stable local_id, then for each incoming ConfigField match it to the kind's
+// descriptor by `key` and write its value into the slot's RAM config at the
+// field's offset — the inverse of fill_config_field. The subsystem still never
+// names a kind, so adding a kind (M10) needs no change here. The driver reads
+// dev->config on every press, so edits take effect live. RAM-only until M6.
+// ---------------------------------------------------------------------------
+
+static const struct zmk_behavior_runtime_slot *find_runtime_slot(uint32_t local_id) {
+    STRUCT_SECTION_FOREACH(zmk_behavior_runtime_slot, slot) {
+        if (zmk_behavior_get_local_id(slot->dev->name) == local_id) {
+            return slot;
+        }
+    }
+    return NULL;
+}
+
+static const struct zmk_behavior_runtime_field *
+find_desc_field(const struct zmk_behavior_runtime_descriptor *desc, const char *key) {
+    for (size_t i = 0; i < desc->fields_len; i++) {
+        if (strcmp(desc->fields[i].key, key) == 0) {
+            return &desc->fields[i];
+        }
+    }
+    return NULL;
+}
+
+// True if `cf` carries a value of the right type and within bounds for field `f`.
+static bool config_field_valid(const struct zmk_behavior_runtime_field *f,
+                               const zmk_behaviors_ConfigField *cf) {
+    if (!cf->has_value) {
+        return false;
+    }
+    switch (f->type) {
+    case ZMK_BEHAVIOR_RT_FIELD_INT:
+        return cf->value.which_v == zmk_behaviors_ConfigValue_int_value_tag &&
+               cf->value.v.int_value >= f->int_min && cf->value.v.int_value <= f->int_max;
+    case ZMK_BEHAVIOR_RT_FIELD_ENUM:
+        return cf->value.which_v == zmk_behaviors_ConfigValue_enum_value_tag &&
+               cf->value.v.enum_value < f->enum_len;
+    case ZMK_BEHAVIOR_RT_FIELD_BOOL:
+        return cf->value.which_v == zmk_behaviors_ConfigValue_bool_value_tag;
+    }
+    return false;
+}
+
+static void apply_config_field(const struct zmk_behavior_runtime_field *f, void *config,
+                               const zmk_behaviors_ConfigField *cf) {
+    uint8_t *base = (uint8_t *)config;
+    switch (f->type) {
+    case ZMK_BEHAVIOR_RT_FIELD_INT:
+        *(int *)(base + f->offset) = cf->value.v.int_value;
+        break;
+    case ZMK_BEHAVIOR_RT_FIELD_ENUM:
+        // enums are int-sized in this codebase (no -fshort-enums).
+        *(int *)(base + f->offset) = (int)cf->value.v.enum_value;
+        break;
+    case ZMK_BEHAVIOR_RT_FIELD_BOOL:
+        *(bool *)(base + f->offset) = cf->value.v.bool_value;
+        break;
+    }
+}
+
+zmk_studio_Response set_custom_behavior(const zmk_studio_Request *req) {
+    const zmk_behaviors_SetCustomBehaviorRequest *set_req =
+        &req->subsystem.behaviors.request_type.set_custom_behavior;
+
+    LOG_DBG("id %d, %d fields", set_req->id, (int)set_req->config_count);
+
+    const struct zmk_behavior_runtime_slot *slot = find_runtime_slot(set_req->id);
+    if (!slot) {
+        LOG_WRN("No runtime behaviour slot with local_id %d", set_req->id);
+        return BEHAVIOR_RESPONSE(
+            set_custom_behavior,
+            zmk_behaviors_SetCustomBehaviorResponse_SET_CUSTOM_BEHAVIOR_RESP_NOT_FOUND);
+    }
+
+    // Pass 1 — validate, so the edit is atomic (no half-applied config on a bad
+    // value). Unknown keys are ignored for forward-compatibility.
+    for (size_t i = 0; i < set_req->config_count; i++) {
+        const zmk_behaviors_ConfigField *cf = &set_req->config[i];
+        const struct zmk_behavior_runtime_field *f = find_desc_field(slot->desc, cf->key);
+        if (f && !config_field_valid(f, cf)) {
+            LOG_WRN("Invalid value for field %s", cf->key);
+            return BEHAVIOR_RESPONSE(
+                set_custom_behavior,
+                zmk_behaviors_SetCustomBehaviorResponse_SET_CUSTOM_BEHAVIOR_RESP_INVALID_PARAMETERS);
+        }
+    }
+
+    // Pass 2 — apply into the slot's mutable RAM config.
+    for (size_t i = 0; i < set_req->config_count; i++) {
+        const zmk_behaviors_ConfigField *cf = &set_req->config[i];
+        const struct zmk_behavior_runtime_field *f = find_desc_field(slot->desc, cf->key);
+        if (f) {
+            apply_config_field(f, slot->config, cf);
+        }
+    }
+
+    return BEHAVIOR_RESPONSE(set_custom_behavior,
+                             zmk_behaviors_SetCustomBehaviorResponse_SET_CUSTOM_BEHAVIOR_RESP_OK);
+}
+
 #else // !CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING
 
 zmk_studio_Response get_custom_behaviors(const zmk_studio_Request *req) {
@@ -356,8 +463,16 @@ zmk_studio_Response get_custom_behaviors(const zmk_studio_Request *req) {
     return BEHAVIOR_RESPONSE(get_custom_behaviors, resp);
 }
 
+zmk_studio_Response set_custom_behavior(const zmk_studio_Request *req) {
+    LOG_DBG("");
+    return BEHAVIOR_RESPONSE(
+        set_custom_behavior,
+        zmk_behaviors_SetCustomBehaviorResponse_SET_CUSTOM_BEHAVIOR_RESP_NOT_FOUND);
+}
+
 #endif // IS_ENABLED(CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING)
 
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, list_all_behaviors, ZMK_STUDIO_RPC_HANDLER_UNSECURED);
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, get_behavior_details, ZMK_STUDIO_RPC_HANDLER_SECURED);
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, get_custom_behaviors, ZMK_STUDIO_RPC_HANDLER_SECURED);
+ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, set_custom_behavior, ZMK_STUDIO_RPC_HANDLER_SECURED);

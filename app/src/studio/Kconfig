@@ -99,6 +99,11 @@ endmenu
 
 config ZMK_STUDIO_RPC_THREAD_STACK_SIZE
     int "RPC Thread Stack Size"
+    # The decoded zmk_studio_Request is a stack local on this thread (rpc.c
+    # rpc_main). set_custom_behavior carries a static ConfigField array
+    # (SetCustomBehaviorRequest.config, see behaviors.options.in) that is charged
+    # to this stack, larger than any keymap/combo request, so give it headroom.
+    default 8192 if ZMK_BEHAVIOR_RUNTIME_EDITING
     default 4096
 
 config ZMK_STUDIO_RPC_RX_BUF_SIZE
