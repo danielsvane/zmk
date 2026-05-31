@@ -16,6 +16,10 @@ if(CONFIG_ZMK_BEHAVIOR_LOCAL_IDS)
   zephyr_linker_sources(DATA_SECTIONS include/linker/zmk-behavior-local-id-map.ld)
 endif()
 
+if(CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING)
+  zephyr_linker_sources(SECTIONS include/linker/zmk-behavior-runtime-slots.ld)
+endif()
+
 zephyr_syscall_header(${APPLICATION_SOURCE_DIR}/include/drivers/behavior.h)
 zephyr_syscall_header(${APPLICATION_SOURCE_DIR}/include/drivers/input_processor.h)
 zephyr_syscall_header(${APPLICATION_SOURCE_DIR}/include/drivers/ext_power.h)

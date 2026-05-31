@@ -42,6 +42,20 @@ endchoice
 endif
 
 
+config ZMK_BEHAVIOR_RUNTIME_EDITING
+    bool "Runtime behaviour editing (ZMK Studio)"
+    default y if ZMK_STUDIO_RPC
+    select ZMK_BEHAVIOR_LOCAL_IDS
+    select SETTINGS
+    select ZMK_KEYMAP_SETTINGS_STORAGE
+    help
+      Expose a pool of spare devicetree behaviour instances (e.g. hold-taps)
+      whose config lives in RAM, so custom behaviour instances can be read,
+      created, edited and deleted at runtime over the Studio RPC protocol —
+      without recompiling firmware. Mirrors ZMK_COMBO_RUNTIME_EDITING. Runtime
+      edits are (from M6) persisted to NVS via the keymap settings-storage
+      machinery the selects above pull in.
+
 config ZMK_BEHAVIOR_HOLD_TAP
     bool
     default y

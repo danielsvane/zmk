@@ -1,0 +1,112 @@
+/*
+ * Copyright (c) 2024 The ZMK Contributors
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+/*
+ * Spare hold-tap pool for runtime behaviour editing (ZMK Studio).
+ *
+ * These are pre-allocated `zmk,behavior-hold-tap` instances marked
+ * `runtime-editable`. When CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING is enabled the
+ * driver gives each a RAM config (seeded from the defaults below) and registers
+ * it as a Studio custom-behaviour slot; otherwise they compile as ordinary
+ * (inert) spare hold-taps. They are unbound until claimed at runtime (M4).
+ *
+ * Devicetree is processed before Kconfig, so the pool cannot be gated on the
+ * Kconfig here — the gating lives in the driver/subsystem C instead. The pool
+ * size is simply the number of nodes below.
+ */
+
+/ {
+    behaviors {
+        rt_ht_0: rt_ht_0 {
+            compatible = "zmk,behavior-hold-tap";
+            #binding-cells = <2>;
+            bindings = <&kp>, <&kp>;
+            flavor = "balanced";
+            tapping-term-ms = <200>;
+            quick-tap-ms = <0>;
+            require-prior-idle-ms = <0>;
+            runtime-editable;
+            display-name = "Spare Hold-Tap 1";
+        };
+        rt_ht_1: rt_ht_1 {
+            compatible = "zmk,behavior-hold-tap";
+            #binding-cells = <2>;
+            bindings = <&kp>, <&kp>;
+            flavor = "balanced";
+            tapping-term-ms = <200>;
+            quick-tap-ms = <0>;
+            require-prior-idle-ms = <0>;
+            runtime-editable;
+            display-name = "Spare Hold-Tap 2";
+        };
+        rt_ht_2: rt_ht_2 {
+            compatible = "zmk,behavior-hold-tap";
+            #binding-cells = <2>;
+            bindings = <&kp>, <&kp>;
+            flavor = "balanced";
+            tapping-term-ms = <200>;
+            quick-tap-ms = <0>;
+            require-prior-idle-ms = <0>;
+            runtime-editable;
+            display-name = "Spare Hold-Tap 3";
+        };
+        rt_ht_3: rt_ht_3 {
+            compatible = "zmk,behavior-hold-tap";
+            #binding-cells = <2>;
+            bindings = <&kp>, <&kp>;
+            flavor = "balanced";
+            tapping-term-ms = <200>;
+            quick-tap-ms = <0>;
+            require-prior-idle-ms = <0>;
+            runtime-editable;
+            display-name = "Spare Hold-Tap 4";
+        };
+        rt_ht_4: rt_ht_4 {
+            compatible = "zmk,behavior-hold-tap";
+            #binding-cells = <2>;
+            bindings = <&kp>, <&kp>;
+            flavor = "balanced";
+            tapping-term-ms = <200>;
+            quick-tap-ms = <0>;
+            require-prior-idle-ms = <0>;
+            runtime-editable;
+            display-name = "Spare Hold-Tap 5";
+        };
+        rt_ht_5: rt_ht_5 {
+            compatible = "zmk,behavior-hold-tap";
+            #binding-cells = <2>;
+            bindings = <&kp>, <&kp>;
+            flavor = "balanced";
+            tapping-term-ms = <200>;
+            quick-tap-ms = <0>;
+            require-prior-idle-ms = <0>;
+            runtime-editable;
+            display-name = "Spare Hold-Tap 6";
+        };
+        rt_ht_6: rt_ht_6 {
+            compatible = "zmk,behavior-hold-tap";
+            #binding-cells = <2>;
+            bindings = <&kp>, <&kp>;
+            flavor = "balanced";
+            tapping-term-ms = <200>;
+            quick-tap-ms = <0>;
+            require-prior-idle-ms = <0>;
+            runtime-editable;
+            display-name = "Spare Hold-Tap 7";
+        };
+        rt_ht_7: rt_ht_7 {
+            compatible = "zmk,behavior-hold-tap";
+            #binding-cells = <2>;
+            bindings = <&kp>, <&kp>;
+            flavor = "balanced";
+            tapping-term-ms = <200>;
+            quick-tap-ms = <0>;
+            require-prior-idle-ms = <0>;
+            runtime-editable;
+            display-name = "Spare Hold-Tap 8";
+        };
+    };
+};

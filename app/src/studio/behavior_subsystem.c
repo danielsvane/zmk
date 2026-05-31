@@ -10,6 +10,8 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <pb_encode.h>
 #include <zmk/studio/rpc.h>
 #include <drivers/behavior.h>
+#include <zmk/behavior.h>
+#include <zmk/behavior_runtime.h>
 #include <zmk/hid.h>
 
 ZMK_RPC_SUBSYSTEM(behaviors)
@@ -212,116 +214,80 @@ zmk_studio_Response get_behavior_details(const zmk_studio_Request *req) {
 // ---------------------------------------------------------------------------
 // Custom behaviours — generic config-schema round-trip.
 //
-// M1 de-risks the kind-agnostic config representation (proto §3.2) before any
-// behaviour driver exists. get_custom_behaviors returns ONE hardcoded fake
-// hold-tap behaviour with two schema-described fields (an int-range and an
-// enum). The repeated submessage lists (CustomBehaviors.behaviors and
+// get_custom_behaviors walks the runtime-editable spare-instance pool
+// (zmk_behavior_runtime_slot section, populated by each participating driver)
+// and, for each slot, encodes a CustomBehavior whose config fields are produced
+// generically from the slot's per-kind descriptor. The encoder never branches
+// on a behaviour kind: it reads each field's current value from the RAM config
+// struct at the descriptor's offset, and reports the descriptor's schema —
+// adding a kind (M10) needs no change here.
+//
+// The repeated submessage lists (CustomBehaviors.behaviors and
 // CustomBehavior.config) are nanopb callbacks, encoded one entry at a time
 // (mirroring combos' encode_combos) so each ConfigField — itself a static
 // struct — sits on the stack only momentarily.
-//
-// M2 replaces this fake with the real devicetree spare-instance pool, driving
-// the same ConfigField encoding from a per-kind config-schema descriptor.
 // ---------------------------------------------------------------------------
 
-// A static description of one fake config field, so the M1 encoder is pure
-// data. Each entry becomes one ConfigField submessage. Only int-range and enum
-// are exercised here; the proto carries the rest (bool / positions / refs) for
-// later milestones.
-struct fake_config_field {
-    const char *key;
-    const char *display_name;
-    // schema
-    pb_size_t which_schema; // zmk_behaviors_ConfigSchema_*_tag
-    int32_t int_min;
-    int32_t int_max;
-    const char *const *enum_names;
-    size_t enum_names_len;
-    // current value
-    pb_size_t which_value; // zmk_behaviors_ConfigValue_*_tag
-    int32_t int_value;
-    uint32_t enum_value;
-};
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING)
 
-static const char *const fake_flavor_names[] = {
-    "hold-preferred",
-    "balanced",
-    "tap-preferred",
-    "tap-unless-interrupted",
-};
-
-static const struct fake_config_field fake_fields[] = {
-    {
-        .key = "tapping_term_ms",
-        .display_name = "Tapping term (ms)",
-        .which_schema = zmk_behaviors_ConfigSchema_int_range_tag,
-        .int_min = 0,
-        .int_max = 5000,
-        .which_value = zmk_behaviors_ConfigValue_int_value_tag,
-        .int_value = 200,
-    },
-    {
-        .key = "flavor",
-        .display_name = "Flavor",
-        .which_schema = zmk_behaviors_ConfigSchema_enum_options_tag,
-        .enum_names = fake_flavor_names,
-        .enum_names_len = ARRAY_SIZE(fake_flavor_names),
-        .which_value = zmk_behaviors_ConfigValue_enum_value_tag,
-        .enum_value = 1, // "balanced"
-    },
-};
-
-// Build a wire ConfigField from a fake_config_field descriptor.
+// Build a wire ConfigField from a descriptor field + the slot's RAM config,
+// reading the current value at the field's struct offset per its type.
 static void fill_config_field(zmk_behaviors_ConfigField *out,
-                              const struct fake_config_field *src) {
+                              const struct zmk_behavior_runtime_field *f, const void *config) {
     *out = (zmk_behaviors_ConfigField)zmk_behaviors_ConfigField_init_zero;
 
-    strncpy(out->key, src->key, sizeof(out->key) - 1);
-    strncpy(out->display_name, src->display_name, sizeof(out->display_name) - 1);
+    strncpy(out->key, f->key, sizeof(out->key) - 1);
+    strncpy(out->display_name, f->display_name, sizeof(out->display_name) - 1);
+
+    const uint8_t *base = (const uint8_t *)config;
 
     out->has_schema = true;
-    out->schema.which_s = src->which_schema;
-    switch (src->which_schema) {
-    case zmk_behaviors_ConfigSchema_int_range_tag:
-        out->schema.s.int_range.min = src->int_min;
-        out->schema.s.int_range.max = src->int_max;
-        break;
-    case zmk_behaviors_ConfigSchema_enum_options_tag: {
-        zmk_behaviors_EnumOptions *opts = &out->schema.s.enum_options;
-        opts->names_count = MIN(src->enum_names_len, ARRAY_SIZE(opts->names));
-        for (size_t i = 0; i < opts->names_count; i++) {
-            strncpy(opts->names[i], src->enum_names[i], sizeof(opts->names[i]) - 1);
-        }
-        break;
-    }
-    default:
-        break;
-    }
-
     out->has_value = true;
-    out->value.which_v = src->which_value;
-    switch (src->which_value) {
-    case zmk_behaviors_ConfigValue_int_value_tag:
-        out->value.v.int_value = src->int_value;
+    switch (f->type) {
+    case ZMK_BEHAVIOR_RT_FIELD_INT: {
+        int32_t v = *(const int *)(base + f->offset);
+        out->schema.which_s = zmk_behaviors_ConfigSchema_int_range_tag;
+        out->schema.s.int_range.min = f->int_min;
+        out->schema.s.int_range.max = f->int_max;
+        out->value.which_v = zmk_behaviors_ConfigValue_int_value_tag;
+        out->value.v.int_value = v;
         break;
-    case zmk_behaviors_ConfigValue_enum_value_tag:
-        out->value.v.enum_value = src->enum_value;
+    }
+    case ZMK_BEHAVIOR_RT_FIELD_ENUM: {
+        // enums are int-sized in this codebase (no -fshort-enums).
+        int v = *(const int *)(base + f->offset);
+        zmk_behaviors_EnumOptions *opts = &out->schema.s.enum_options;
+        out->schema.which_s = zmk_behaviors_ConfigSchema_enum_options_tag;
+        opts->names_count = MIN(f->enum_len, ARRAY_SIZE(opts->names));
+        for (size_t i = 0; i < opts->names_count; i++) {
+            strncpy(opts->names[i], f->enum_names[i], sizeof(opts->names[i]) - 1);
+        }
+        out->value.which_v = zmk_behaviors_ConfigValue_enum_value_tag;
+        out->value.v.enum_value = (uint32_t)v;
         break;
-    default:
+    }
+    case ZMK_BEHAVIOR_RT_FIELD_BOOL: {
+        bool v = *(const bool *)(base + f->offset);
+        out->schema.which_s = zmk_behaviors_ConfigSchema_bool_schema_tag;
+        out->value.which_v = zmk_behaviors_ConfigValue_bool_value_tag;
+        out->value.v.bool_value = v;
         break;
+    }
     }
 }
 
-// Encodes CustomBehavior.config — one ConfigField submessage per fake_field.
+// Encodes CustomBehavior.config — one ConfigField submessage per descriptor field.
 static bool encode_config_fields(pb_ostream_t *stream, const pb_field_t *field,
                                  void *const *arg) {
-    for (size_t i = 0; i < ARRAY_SIZE(fake_fields); i++) {
+    const struct zmk_behavior_runtime_slot *slot = (const struct zmk_behavior_runtime_slot *)*arg;
+
+    for (size_t i = 0; i < slot->desc->fields_len; i++) {
         if (!pb_encode_tag_for_field(stream, field)) {
             return false;
         }
 
         zmk_behaviors_ConfigField cf;
-        fill_config_field(&cf, &fake_fields[i]);
+        fill_config_field(&cf, &slot->desc->fields[i], slot->config);
 
         if (!pb_encode_submessage(stream, &zmk_behaviors_ConfigField_msg, &cf)) {
             LOG_WRN("Failed to encode config field %d", (int)i);
@@ -332,22 +298,39 @@ static bool encode_config_fields(pb_ostream_t *stream, const pb_field_t *field,
     return true;
 }
 
-// Encodes CustomBehaviors.behaviors — the one hardcoded fake behaviour for M1.
+// The runtime slot's display name comes from the behaviour metadata (DT
+// display-name), matching get_behavior_details; falls back to the device name.
+static const char *runtime_slot_display_name(const struct device *dev) {
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_METADATA)
+    STRUCT_SECTION_FOREACH(zmk_behavior_ref, ref) {
+        if (ref->device == dev) {
+            return ref->metadata.display_name;
+        }
+    }
+#endif
+    return dev->name;
+}
+
+// Encodes CustomBehaviors.behaviors — one CustomBehavior per runtime pool slot.
 static bool encode_custom_behaviors(pb_ostream_t *stream, const pb_field_t *field,
                                     void *const *arg) {
-    if (!pb_encode_tag_for_field(stream, field)) {
-        return false;
-    }
+    STRUCT_SECTION_FOREACH(zmk_behavior_runtime_slot, slot) {
+        if (!pb_encode_tag_for_field(stream, field)) {
+            return false;
+        }
 
-    zmk_behaviors_CustomBehavior beh = zmk_behaviors_CustomBehavior_init_zero;
-    beh.id = 1;
-    strncpy(beh.display_name, "Demo HRM", sizeof(beh.display_name) - 1);
-    strncpy(beh.kind, "hold-tap", sizeof(beh.kind) - 1);
-    beh.config.funcs.encode = encode_config_fields;
+        zmk_behaviors_CustomBehavior beh = zmk_behaviors_CustomBehavior_init_zero;
+        beh.id = zmk_behavior_get_local_id(slot->dev->name);
+        strncpy(beh.display_name, runtime_slot_display_name(slot->dev),
+                sizeof(beh.display_name) - 1);
+        strncpy(beh.kind, slot->desc->kind, sizeof(beh.kind) - 1);
+        beh.config.funcs.encode = encode_config_fields;
+        beh.config.arg = (void *)slot;
 
-    if (!pb_encode_submessage(stream, &zmk_behaviors_CustomBehavior_msg, &beh)) {
-        LOG_WRN("Failed to encode custom behaviour submessage");
-        return false;
+        if (!pb_encode_submessage(stream, &zmk_behaviors_CustomBehavior_msg, &beh)) {
+            LOG_WRN("Failed to encode custom behaviour submessage");
+            return false;
+        }
     }
 
     return true;
@@ -357,10 +340,23 @@ zmk_studio_Response get_custom_behaviors(const zmk_studio_Request *req) {
     LOG_DBG("");
     zmk_behaviors_CustomBehaviors resp = zmk_behaviors_CustomBehaviors_init_zero;
     resp.behaviors.funcs.encode = encode_custom_behaviors;
-    resp.max = 0; // no real pool yet (M2 reports the real capacity)
+
+    size_t count = 0;
+    STRUCT_SECTION_COUNT(zmk_behavior_runtime_slot, &count);
+    resp.max = (uint32_t)count;
 
     return BEHAVIOR_RESPONSE(get_custom_behaviors, resp);
 }
+
+#else // !CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING
+
+zmk_studio_Response get_custom_behaviors(const zmk_studio_Request *req) {
+    LOG_DBG("");
+    zmk_behaviors_CustomBehaviors resp = zmk_behaviors_CustomBehaviors_init_zero;
+    return BEHAVIOR_RESPONSE(get_custom_behaviors, resp);
+}
+
+#endif // IS_ENABLED(CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING)
 
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, list_all_behaviors, ZMK_STUDIO_RPC_HANDLER_UNSECURED);
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, get_behavior_details, ZMK_STUDIO_RPC_HANDLER_SECURED);
