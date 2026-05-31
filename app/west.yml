@@ -41,7 +41,7 @@ manifest:
       path: modules/lib/gui/lvgl
       remote: zmkfirmware
     - name: zmk-studio-messages
-      revision: combos
+      revision: customkeyboards
       path: modules/msgs/zmk-studio-messages
       remote: danielsvane
   group-filter: [+optional]
