@@ -619,6 +619,53 @@ zmk_studio_Response add_custom_behavior(const zmk_studio_Request *req) {
 }
 
 // ---------------------------------------------------------------------------
+// remove_custom_behavior — free a claimed slot, turning it back into an
+// unclaimed spare (M8: RAM-only until save_changes persists it). We locate the
+// slot by its stable local_id and clear its claimed state; it then disappears
+// from both list_all_behaviors (runtime_local_id_hidden) and
+// get_custom_behaviors (encode skips inactive slots), and save_changes
+// settings_deletes its NVS record (the slot is now !active). The pool has no
+// devicetree-seeded slots, so a deleted slot is never reseeded and no tombstone
+// is required (unlike combos' deleted stock combos). A keymap/combo still bound
+// to the freed slot keeps resolving its stable local_id to the (now inactive)
+// DT pool device, so the binding degrades to that device's default config
+// rather than dangling. Still kind-agnostic.
+// ---------------------------------------------------------------------------
+
+zmk_studio_Response remove_custom_behavior(const zmk_studio_Request *req) {
+    const zmk_behaviors_RemoveCustomBehaviorRequest *rm_req =
+        &req->subsystem.behaviors.request_type.remove_custom_behavior;
+
+    LOG_DBG("id %d", rm_req->id);
+
+    zmk_behaviors_RemoveCustomBehaviorResponse resp =
+        zmk_behaviors_RemoveCustomBehaviorResponse_init_zero;
+
+    const struct zmk_behavior_runtime_slot *slot = find_runtime_slot(rm_req->id);
+    if (!slot || !slot->state->active) {
+        LOG_WRN("No claimed runtime behaviour slot with local_id %d", rm_req->id);
+        resp.which_result = zmk_behaviors_RemoveCustomBehaviorResponse_err_tag;
+        resp.result.err =
+            zmk_behaviors_RemoveCustomBehaviorErrorCode_REMOVE_CUSTOM_BEHAVIOR_ERR_NOT_FOUND;
+        return BEHAVIOR_RESPONSE(remove_custom_behavior, resp);
+    }
+
+    // Free the slot. The config RAM is left as-is (harmless: an unclaimed slot is
+    // hidden); a fresh claim reseeds the name and the user re-edits the config.
+    slot->state->active = false;
+    slot->state->name[0] = '\0';
+
+    // Deleting is an unsaved change until persisted (M6 machinery; save_changes
+    // will settings_delete the record because the slot is now inactive).
+    zmk_behavior_runtime_mark_dirty(rm_req->id);
+    raise_zmk_studio_rpc_notification((struct zmk_studio_rpc_notification){
+        .notification = BEHAVIOR_NOTIFICATION(unsaved_changes_status_changed, true)});
+
+    resp.which_result = zmk_behaviors_RemoveCustomBehaviorResponse_ok_tag;
+    return BEHAVIOR_RESPONSE(remove_custom_behavior, resp);
+}
+
+// ---------------------------------------------------------------------------
 // Warm persistence handlers (M6) — thin wrappers over the descriptor-driven
 // persistence in behavior_runtime.c, mirroring combo_subsystem.c. Each raises
 // the unsaved-changes notification so the Studio header's Save indicator tracks
@@ -702,6 +749,16 @@ zmk_studio_Response add_custom_behavior(const zmk_studio_Request *req) {
     return BEHAVIOR_RESPONSE(add_custom_behavior, resp);
 }
 
+zmk_studio_Response remove_custom_behavior(const zmk_studio_Request *req) {
+    LOG_DBG("");
+    zmk_behaviors_RemoveCustomBehaviorResponse resp =
+        zmk_behaviors_RemoveCustomBehaviorResponse_init_zero;
+    resp.which_result = zmk_behaviors_RemoveCustomBehaviorResponse_err_tag;
+    resp.result.err =
+        zmk_behaviors_RemoveCustomBehaviorErrorCode_REMOVE_CUSTOM_BEHAVIOR_ERR_NOT_FOUND;
+    return BEHAVIOR_RESPONSE(remove_custom_behavior, resp);
+}
+
 static zmk_studio_Response check_unsaved_changes(const zmk_studio_Request *req) {
     LOG_DBG("");
     return BEHAVIOR_RESPONSE(check_unsaved_changes, false);
@@ -727,6 +784,7 @@ ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, get_behavior_details, ZMK_STUDIO_RPC_HANDLE
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, get_custom_behaviors, ZMK_STUDIO_RPC_HANDLER_SECURED);
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, set_custom_behavior, ZMK_STUDIO_RPC_HANDLER_SECURED);
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, add_custom_behavior, ZMK_STUDIO_RPC_HANDLER_SECURED);
+ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, remove_custom_behavior, ZMK_STUDIO_RPC_HANDLER_SECURED);
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, check_unsaved_changes, ZMK_STUDIO_RPC_HANDLER_SECURED);
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, save_changes, ZMK_STUDIO_RPC_HANDLER_SECURED);
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, discard_changes, ZMK_STUDIO_RPC_HANDLER_SECURED);
