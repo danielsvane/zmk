@@ -7,6 +7,8 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
+#include <errno.h>
+
 #include <pb_encode.h>
 #include <zmk/studio/rpc.h>
 #include <drivers/behavior.h>
@@ -17,6 +19,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 ZMK_RPC_SUBSYSTEM(behaviors)
 
 #define BEHAVIOR_RESPONSE(type, ...) ZMK_RPC_RESPONSE(behaviors, type, __VA_ARGS__)
+#define BEHAVIOR_NOTIFICATION(type, ...) ZMK_RPC_NOTIFICATION(behaviors, type, __VA_ARGS__)
 
 #if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING)
 // Locate a runtime pool slot by its device's stable local_id, or by device.
@@ -529,6 +532,12 @@ zmk_studio_Response set_custom_behavior(const zmk_studio_Request *req) {
         }
     }
 
+    // The edit is RAM-only until saved (M6); flag it so the Studio header shows
+    // unsaved changes and save_changes persists this slot.
+    zmk_behavior_runtime_mark_dirty(set_req->id);
+    raise_zmk_studio_rpc_notification((struct zmk_studio_rpc_notification){
+        .notification = BEHAVIOR_NOTIFICATION(unsaved_changes_status_changed, true)});
+
     return BEHAVIOR_RESPONSE(set_custom_behavior,
                              zmk_behaviors_SetCustomBehaviorResponse_SET_CUSTOM_BEHAVIOR_RESP_OK);
 }
@@ -594,12 +603,79 @@ zmk_studio_Response add_custom_behavior(const zmk_studio_Request *req) {
         }
     }
 
+    uint32_t local_id = zmk_behavior_get_local_id(slot->dev->name);
+
+    // Claiming a slot is an unsaved change until persisted (M6).
+    zmk_behavior_runtime_mark_dirty(local_id);
+    raise_zmk_studio_rpc_notification((struct zmk_studio_rpc_notification){
+        .notification = BEHAVIOR_NOTIFICATION(unsaved_changes_status_changed, true)});
+
     resp.which_result = zmk_behaviors_AddCustomBehaviorResponse_ok_tag;
-    resp.result.ok.id = zmk_behavior_get_local_id(slot->dev->name);
+    resp.result.ok.id = local_id;
     resp.result.ok.has_behavior = true;
     fill_custom_behavior(&resp.result.ok.behavior, slot);
 
     return BEHAVIOR_RESPONSE(add_custom_behavior, resp);
+}
+
+// ---------------------------------------------------------------------------
+// Warm persistence handlers (M6) — thin wrappers over the descriptor-driven
+// persistence in behavior_runtime.c, mirroring combo_subsystem.c. Each raises
+// the unsaved-changes notification so the Studio header's Save indicator tracks
+// state without polling.
+// ---------------------------------------------------------------------------
+
+static zmk_studio_Response check_unsaved_changes(const zmk_studio_Request *req) {
+    LOG_DBG("");
+    return BEHAVIOR_RESPONSE(check_unsaved_changes,
+                             zmk_behavior_runtime_check_unsaved_changes() > 0);
+}
+
+static void map_errno_to_save_resp(int err, zmk_behaviors_SaveChangesResponse *resp) {
+    resp->which_result = zmk_behaviors_SaveChangesResponse_err_tag;
+    switch (err) {
+    case -ENOTSUP:
+        resp->result.err = zmk_behaviors_SaveChangesErrorCode_SAVE_CHANGES_ERR_NOT_SUPPORTED;
+        break;
+    case -ENOSPC:
+        resp->result.err = zmk_behaviors_SaveChangesErrorCode_SAVE_CHANGES_ERR_NO_SPACE;
+        break;
+    default:
+        resp->result.err = zmk_behaviors_SaveChangesErrorCode_SAVE_CHANGES_ERR_GENERIC;
+        break;
+    }
+}
+
+static zmk_studio_Response save_changes(const zmk_studio_Request *req) {
+    LOG_DBG("");
+    zmk_behaviors_SaveChangesResponse resp = zmk_behaviors_SaveChangesResponse_init_zero;
+    resp.which_result = zmk_behaviors_SaveChangesResponse_ok_tag;
+    resp.result.ok = true;
+
+    int ret = zmk_behavior_runtime_save_changes();
+    if (ret < 0) {
+        LOG_WRN("Failed to save runtime behaviour changes (%d)", ret);
+        map_errno_to_save_resp(ret, &resp);
+        return BEHAVIOR_RESPONSE(save_changes, resp);
+    }
+
+    raise_zmk_studio_rpc_notification((struct zmk_studio_rpc_notification){
+        .notification = BEHAVIOR_NOTIFICATION(unsaved_changes_status_changed, false)});
+
+    return BEHAVIOR_RESPONSE(save_changes, resp);
+}
+
+static zmk_studio_Response discard_changes(const zmk_studio_Request *req) {
+    LOG_DBG("");
+    int ret = zmk_behavior_runtime_discard_changes();
+    if (ret < 0) {
+        return ZMK_RPC_SIMPLE_ERR(GENERIC);
+    }
+
+    raise_zmk_studio_rpc_notification((struct zmk_studio_rpc_notification){
+        .notification = BEHAVIOR_NOTIFICATION(unsaved_changes_status_changed, false)});
+
+    return BEHAVIOR_RESPONSE(discard_changes, true);
 }
 
 #else // !CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING
@@ -626,6 +702,24 @@ zmk_studio_Response add_custom_behavior(const zmk_studio_Request *req) {
     return BEHAVIOR_RESPONSE(add_custom_behavior, resp);
 }
 
+static zmk_studio_Response check_unsaved_changes(const zmk_studio_Request *req) {
+    LOG_DBG("");
+    return BEHAVIOR_RESPONSE(check_unsaved_changes, false);
+}
+
+static zmk_studio_Response save_changes(const zmk_studio_Request *req) {
+    LOG_DBG("");
+    zmk_behaviors_SaveChangesResponse resp = zmk_behaviors_SaveChangesResponse_init_zero;
+    resp.which_result = zmk_behaviors_SaveChangesResponse_err_tag;
+    resp.result.err = zmk_behaviors_SaveChangesErrorCode_SAVE_CHANGES_ERR_NOT_SUPPORTED;
+    return BEHAVIOR_RESPONSE(save_changes, resp);
+}
+
+static zmk_studio_Response discard_changes(const zmk_studio_Request *req) {
+    LOG_DBG("");
+    return BEHAVIOR_RESPONSE(discard_changes, true);
+}
+
 #endif // IS_ENABLED(CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING)
 
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, list_all_behaviors, ZMK_STUDIO_RPC_HANDLER_UNSECURED);
@@ -633,3 +727,13 @@ ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, get_behavior_details, ZMK_STUDIO_RPC_HANDLE
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, get_custom_behaviors, ZMK_STUDIO_RPC_HANDLER_SECURED);
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, set_custom_behavior, ZMK_STUDIO_RPC_HANDLER_SECURED);
 ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, add_custom_behavior, ZMK_STUDIO_RPC_HANDLER_SECURED);
+ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, check_unsaved_changes, ZMK_STUDIO_RPC_HANDLER_SECURED);
+ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, save_changes, ZMK_STUDIO_RPC_HANDLER_SECURED);
+ZMK_RPC_SUBSYSTEM_HANDLER(behaviors, discard_changes, ZMK_STUDIO_RPC_HANDLER_SECURED);
+
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING)
+// Wipe persisted custom behaviours on a Studio "reset settings" (mirror combos).
+static int behaviors_settings_reset(void) { return zmk_behavior_runtime_reset_settings(); }
+
+ZMK_RPC_SUBSYSTEM_SETTINGS_RESET(behaviors, behaviors_settings_reset);
+#endif

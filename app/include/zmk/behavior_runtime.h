@@ -11,6 +11,8 @@
 #include <zephyr/device.h>
 #include <zephyr/sys/iterable_sections.h>
 
+#include <zmk/behavior.h> // zmk_behavior_local_id_t
+
 /**
  * Kind-agnostic runtime behaviour configuration framework.
  *
@@ -77,11 +79,17 @@ struct zmk_behavior_runtime_descriptor {
  * matches the proto CustomBehavior.display_name max_size. */
 #define ZMK_BEHAVIOR_RUNTIME_NAME_SIZE 48
 
+/** Capacity (including the null terminator) of a kind string — matches the proto
+ * CustomBehavior.kind max_size. Stored in each NVS record as a sanity guard. */
+#define ZMK_BEHAVIOR_RUNTIME_KIND_SIZE 24
+
 /** Per-slot mutable RAM state. The slot struct itself is const (ROM), so the
  * bits that change at runtime — whether the slot has been claimed as a real
- * behaviour (M4), and its user-given display name — live here. */
+ * behaviour (M4), its user-given display name, and whether it has edits not yet
+ * persisted to NVS (M6) — live here. */
 struct zmk_behavior_runtime_state {
-    bool active;                              // claimed via add_custom_behavior?
+    bool active;                               // claimed via add_custom_behavior?
+    bool dirty;                                // edited since last save (M6)
     char name[ZMK_BEHAVIOR_RUNTIME_NAME_SIZE]; // user display name (empty until claimed)
 };
 
@@ -103,3 +111,30 @@ struct zmk_behavior_runtime_slot {
         .desc = (_desc),                                                                            \
         .state = &name##_state,                                                                     \
     }
+
+/**
+ * Persistence (M6, see app/src/behavior_runtime.c). Edits made via the Studio
+ * RPC (set/add) live only in each slot's RAM config until saved. These mirror
+ * the combos persistence API (zmk_combos_save_changes etc.); the Studio behaviour
+ * subsystem's save/discard/check handlers call straight into them, and the
+ * subsystem marks a slot dirty after every successful set/add. Persistence is
+ * descriptor-driven (it iterates each slot's fields), so it stays kind-agnostic.
+ */
+
+/** Flag the slot owning `local_id` as having unsaved edits. No-op if no slot
+ * matches. Called by set_custom_behavior / add_custom_behavior. */
+void zmk_behavior_runtime_mark_dirty(zmk_behavior_local_id_t local_id);
+
+/** Non-zero if any slot has edits not yet persisted to NVS. */
+int zmk_behavior_runtime_check_unsaved_changes(void);
+
+/** Persist every dirty slot to NVS (active slots written, freed slots deleted)
+ * and clear their dirty bits. 0 on success, negative errno on failure. */
+int zmk_behavior_runtime_save_changes(void);
+
+/** Revert all slots to their last-saved state (re-applying persisted records
+ * over a cleared pool) and clear dirty bits. 0 on success, negative errno. */
+int zmk_behavior_runtime_discard_changes(void);
+
+/** Factory reset: delete every persisted slot record and clear the pool. */
+int zmk_behavior_runtime_reset_settings(void);
