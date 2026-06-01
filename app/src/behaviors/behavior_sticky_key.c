@@ -19,6 +19,7 @@
 #include <zmk/events/modifiers_state_changed.h>
 #include <zmk/hid.h>
 #include <zmk/keymap.h>
+#include <zmk/behavior_runtime.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
@@ -384,17 +385,88 @@ static int behavior_sticky_key_init(const struct device *dev) {
     return 0;
 }
 
-#define KP_INST(n)                                                                                 \
-    static const struct behavior_sticky_key_config behavior_sticky_key_config_##n = {              \
+// The config initializer body, shared by the const (built-in) and RAM
+// (runtime-editable pool) instance variants below.
+#define SK_CFG_INIT(n)                                                                             \
+    {                                                                                              \
         .behavior = ZMK_KEYMAP_EXTRACT_BINDING(0, DT_DRV_INST(n)),                                 \
         .release_after_ms = DT_INST_PROP(n, release_after_ms),                                     \
         .quick_release = DT_INST_PROP(n, quick_release),                                           \
         .lazy = DT_INST_PROP(n, lazy),                                                             \
         .ignore_modifiers = DT_INST_PROP(n, ignore_modifiers),                                     \
-    };                                                                                             \
+    }
+
+// Built-in instance: config is const, lives in ROM.
+#define KP_INST_STD(n)                                                                             \
+    static const struct behavior_sticky_key_config behavior_sticky_key_config_##n = SK_CFG_INIT(n); \
     BEHAVIOR_DT_INST_DEFINE(n, behavior_sticky_key_init, NULL, NULL,                               \
                             &behavior_sticky_key_config_##n, POST_KERNEL,                          \
                             CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, &behavior_sticky_key_driver_api);
+
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING)
+
+// The sticky-key editable-config schema (M10) — the second runtime kind, proving
+// the framework generalises. Like hold-tap's ht_descriptor, the Studio subsystem
+// reads each field generically from its struct offset; it never names
+// "sticky-key". The wrapped sub-binding (`behavior`) is left at its DT default
+// and is NOT an editable field (sub-binding editing is out of scope).
+static const struct zmk_behavior_runtime_field sk_fields[] = {
+    {
+        .key = "release_after_ms",
+        .display_name = "Release after (ms)",
+        .type = ZMK_BEHAVIOR_RT_FIELD_INT,
+        .offset = offsetof(struct behavior_sticky_key_config, release_after_ms),
+        .int_min = 0,
+        .int_max = 5000,
+    },
+    {
+        .key = "quick_release",
+        .display_name = "Quick release",
+        .type = ZMK_BEHAVIOR_RT_FIELD_BOOL,
+        .offset = offsetof(struct behavior_sticky_key_config, quick_release),
+    },
+    {
+        .key = "lazy",
+        .display_name = "Lazy",
+        .type = ZMK_BEHAVIOR_RT_FIELD_BOOL,
+        .offset = offsetof(struct behavior_sticky_key_config, lazy),
+    },
+    {
+        .key = "ignore_modifiers",
+        .display_name = "Ignore modifiers",
+        .type = ZMK_BEHAVIOR_RT_FIELD_BOOL,
+        .offset = offsetof(struct behavior_sticky_key_config, ignore_modifiers),
+    },
+};
+
+static const struct zmk_behavior_runtime_descriptor sk_descriptor = {
+    .kind = "sticky-key",
+    .fields = sk_fields,
+    .fields_len = ARRAY_SIZE(sk_fields),
+};
+
+// Runtime-editable pool instance: config lives in RAM (non-const), seeded from
+// the DT defaults at load, so the Studio subsystem can read and mutate it in
+// place — the driver reads dev->config on every press, so edits are live. The
+// instance is also registered as a runtime slot for the subsystem. Sticky-key
+// has no flexible-array member, so no per-slot init wrapper is needed (unlike
+// runtime hold-tap).
+#define KP_INST_RT(n)                                                                              \
+    static struct behavior_sticky_key_config behavior_sticky_key_config_##n = SK_CFG_INIT(n);      \
+    BEHAVIOR_DT_INST_DEFINE(n, behavior_sticky_key_init, NULL, NULL,                               \
+                            &behavior_sticky_key_config_##n, POST_KERNEL,                          \
+                            CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, &behavior_sticky_key_driver_api); \
+    ZMK_BEHAVIOR_RUNTIME_SLOT_DEFINE(zmk_rt_sk_slot_##n, DEVICE_DT_INST_GET(n),                    \
+                                     &behavior_sticky_key_config_##n, &sk_descriptor);
+
+#define KP_INST(n)                                                                                 \
+    COND_CODE_1(DT_INST_PROP(n, runtime_editable), (KP_INST_RT(n)), (KP_INST_STD(n)))
+
+#else
+
+#define KP_INST(n) KP_INST_STD(n)
+
+#endif // IS_ENABLED(CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING)
 
 DT_INST_FOREACH_STATUS_OKAY(KP_INST)
 

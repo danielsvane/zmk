@@ -1,0 +1,63 @@
+/*
+ * Copyright (c) 2024 The ZMK Contributors
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+/*
+ * Spare sticky-key pool for runtime behaviour editing (ZMK Studio).
+ *
+ * The second runtime-instantiable kind (M10), proving the framework is
+ * kind-agnostic: these are pre-allocated `zmk,behavior-sticky-key` instances
+ * marked `runtime-editable`. When CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING is enabled
+ * the driver gives each a RAM config (seeded from the defaults below) and
+ * registers it as a Studio custom-behaviour slot via the same generic machinery
+ * the hold-tap pool uses; otherwise they compile as ordinary (inert) spare
+ * sticky keys. They are unbound until claimed at runtime.
+ *
+ * Sticky-key has no flexible-array config member, so (unlike runtime_hold_tap)
+ * the nodes need no placeholder array and the driver needs no per-slot init
+ * wrapper. The wrapped behaviour stays at the DT default `&kp` (sub-binding
+ * editing is out of scope); a claimed slot edits only its scalar config.
+ *
+ * Devicetree is processed before Kconfig, so the pool cannot be gated on the
+ * Kconfig here — the gating lives in the driver/subsystem C instead. The pool
+ * size is simply the number of nodes below.
+ */
+
+/ {
+    behaviors {
+        rt_sk_0: rt_sk_0 {
+            compatible = "zmk,behavior-sticky-key";
+            #binding-cells = <1>;
+            bindings = <&kp>;
+            release-after-ms = <1000>;
+            runtime-editable;
+            display-name = "Spare Sticky Key 1";
+        };
+        rt_sk_1: rt_sk_1 {
+            compatible = "zmk,behavior-sticky-key";
+            #binding-cells = <1>;
+            bindings = <&kp>;
+            release-after-ms = <1000>;
+            runtime-editable;
+            display-name = "Spare Sticky Key 2";
+        };
+        rt_sk_2: rt_sk_2 {
+            compatible = "zmk,behavior-sticky-key";
+            #binding-cells = <1>;
+            bindings = <&kp>;
+            release-after-ms = <1000>;
+            runtime-editable;
+            display-name = "Spare Sticky Key 3";
+        };
+        rt_sk_3: rt_sk_3 {
+            compatible = "zmk,behavior-sticky-key";
+            #binding-cells = <1>;
+            bindings = <&kp>;
+            release-after-ms = <1000>;
+            runtime-editable;
+            display-name = "Spare Sticky Key 4";
+        };
+    };
+};

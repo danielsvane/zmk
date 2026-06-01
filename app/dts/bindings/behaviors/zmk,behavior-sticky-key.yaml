@@ -20,3 +20,9 @@ properties:
     type: boolean
   ignore-modifiers:
     type: boolean
+  runtime-editable:
+    type: boolean
+    description: |
+      Marks this instance as part of the runtime-editable spare pool
+      (CONFIG_ZMK_BEHAVIOR_RUNTIME_EDITING). Its config is placed in RAM and
+      registered as a Studio custom-behaviour slot. Not for hand-written keymaps.
