@@ -90,6 +90,7 @@ struct zmk_behavior_runtime_descriptor {
 struct zmk_behavior_runtime_state {
     bool active;                               // claimed via add_custom_behavior?
     bool dirty;                                // edited since last save (M6)
+    bool tombstoned;                           // a deleted FACTORY slot, saved (M12)
     char name[ZMK_BEHAVIOR_RUNTIME_NAME_SIZE]; // user display name (empty until claimed)
 };
 
@@ -99,18 +100,32 @@ struct zmk_behavior_runtime_slot {
     void *config;             // RAM config object for `dev` (kind-specific layout)
     const struct zmk_behavior_runtime_descriptor *desc;
     struct zmk_behavior_runtime_state *state; // mutable per-slot RAM state
+
+    // FACTORY slots (M12): a slot whose DT node sets `runtime-default-active`
+    // boots claimed with `default_name` + its DT config, unless an NVS record or
+    // tombstone overrides that. Plain spares leave these false/NULL.
+    bool default_active;
+    const char *default_name; // DT display-name, copied into state->name when seeded
 };
 
 /** Register a pool slot into the iterable section walked by the Studio subsystem.
- * Allocates the slot's mutable RAM state (claimed flag + name) alongside it. */
-#define ZMK_BEHAVIOR_RUNTIME_SLOT_DEFINE(name, _dev, _config, _desc)                                \
+ * Allocates the slot's mutable RAM state (claimed flag + name) alongside it.
+ * `_default_active` / `_default_name` mark a FACTORY slot (M12). */
+#define ZMK_BEHAVIOR_RUNTIME_SLOT_DEFINE_SEEDED(name, _dev, _config, _desc, _default_active,        \
+                                                _default_name)                                      \
     static struct zmk_behavior_runtime_state name##_state = {0};                                   \
     static const STRUCT_SECTION_ITERABLE(zmk_behavior_runtime_slot, name) = {                       \
         .dev = (_dev),                                                                              \
         .config = (_config),                                                                        \
         .desc = (_desc),                                                                            \
         .state = &name##_state,                                                                     \
+        .default_active = (_default_active),                                                        \
+        .default_name = (_default_name),                                                            \
     }
+
+/** Register a plain (non-factory) pool slot. */
+#define ZMK_BEHAVIOR_RUNTIME_SLOT_DEFINE(name, _dev, _config, _desc)                                \
+    ZMK_BEHAVIOR_RUNTIME_SLOT_DEFINE_SEEDED(name, _dev, _config, _desc, false, NULL)
 
 /**
  * Persistence (M6, see app/src/behavior_runtime.c). Edits made via the Studio
@@ -136,5 +151,13 @@ int zmk_behavior_runtime_save_changes(void);
  * over a cleared pool) and clear dirty bits. 0 on success, negative errno. */
 int zmk_behavior_runtime_discard_changes(void);
 
-/** Factory reset: delete every persisted slot record and clear the pool. */
+/** Factory reset: delete every persisted slot record + tombstone and clear the
+ * pool. Factory slots are re-seeded from devicetree on the next boot. */
 int zmk_behavior_runtime_reset_settings(void);
+
+/** Activate every FACTORY slot (runtime-default-active) that has neither a
+ * persisted record nor a tombstone, copying its DT display-name into state.
+ * Idempotent (skips already-active slots). Run after settings load so user NVS
+ * edits/deletes win; safe to call again after discard. The slot's config is the
+ * DT default already in RAM (set at device init), so only state is touched. */
+void zmk_behavior_runtime_seed_factory_defaults(void);

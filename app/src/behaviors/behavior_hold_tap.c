@@ -962,27 +962,48 @@ static const struct zmk_behavior_runtime_descriptor ht_descriptor = {
     .fields_len = ARRAY_SIZE(ht_fields),
 };
 
+// Sentinel terminating a runtime slot's DT hold_trigger_key_positions list. The
+// flexible array is sized to ZMK_BEHAVIOR_RUNTIME_POSITIONS_MAX (32) for RAM
+// backing regardless of how many positions are actually meaningful, so a node
+// that wants N (<32) real positions lists them then pads to 32 with this
+// sentinel; the real length is recovered by scanning up to the first sentinel.
+// 0xffffffff can never be a real key position (positions are small indices).
+#define HT_RT_POSITIONS_END 0xffffffffU
+
+static int32_t ht_rt_positions_len(const int32_t *positions) {
+    int32_t len = 0;
+    while (len < ZMK_BEHAVIOR_RUNTIME_POSITIONS_MAX &&
+           (uint32_t)positions[len] != HT_RT_POSITIONS_END) {
+        len++;
+    }
+    return len;
+}
+
 // Runtime-editable pool instance: config lives in RAM (non-const), seeded from
 // the DT defaults at load, so the Studio subsystem can read (M2) and mutate
 // (M3+) it in place — the driver reads dev->config on every press, so edits are
 // live. The instance is also registered as a runtime slot for the subsystem.
-// The DT placeholder (runtime_hold_tap.dtsi) sizes hold_trigger_key_positions[]
-// to its full capacity for RAM backing storage, which also sets _len to that
-// capacity. A freshly-booted spare has no trigger positions, so zero the active
-// length before the normal init runs; a runtime edit (set_custom_behavior) then
-// fills it in.
+// The DT positions array is sized to its full capacity (32) for RAM backing.
+// A plain spare boots with no trigger positions (length 0); a FACTORY node
+// (runtime-default-active, M12) ships meaningful positions, so its real length
+// is recovered from the sentinel terminator. A runtime edit (set_custom_behavior)
+// overwrites both either way.
 #define KP_INST_RT(n)                                                                              \
     static struct behavior_hold_tap_config behavior_hold_tap_config_##n = HT_CFG_INIT(n);          \
     static int behavior_hold_tap_rt_init_##n(const struct device *dev) {                            \
-        behavior_hold_tap_config_##n.hold_trigger_key_positions_len = 0;                            \
+        behavior_hold_tap_config_##n.hold_trigger_key_positions_len = COND_CODE_1(                  \
+            DT_INST_PROP(n, runtime_default_active),                                                \
+            (ht_rt_positions_len(behavior_hold_tap_config_##n.hold_trigger_key_positions)), (0));   \
         return behavior_hold_tap_init(dev);                                                         \
     }                                                                                              \
     static struct behavior_hold_tap_data behavior_hold_tap_data_##n = {};                          \
     BEHAVIOR_DT_INST_DEFINE(n, behavior_hold_tap_rt_init_##n, NULL, &behavior_hold_tap_data_##n,    \
                             &behavior_hold_tap_config_##n, POST_KERNEL,                             \
                             CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, &behavior_hold_tap_driver_api);    \
-    ZMK_BEHAVIOR_RUNTIME_SLOT_DEFINE(zmk_rt_slot_##n, DEVICE_DT_INST_GET(n),                        \
-                                     &behavior_hold_tap_config_##n, &ht_descriptor);
+    ZMK_BEHAVIOR_RUNTIME_SLOT_DEFINE_SEEDED(zmk_rt_slot_##n, DEVICE_DT_INST_GET(n),                 \
+                                            &behavior_hold_tap_config_##n, &ht_descriptor,          \
+                                            DT_INST_PROP(n, runtime_default_active),                \
+                                            DT_INST_PROP_OR(n, display_name, ""));
 
 #define KP_INST(n)                                                                                 \
     COND_CODE_1(DT_INST_PROP(n, runtime_editable), (KP_INST_RT(n)), (KP_INST_STD(n)))

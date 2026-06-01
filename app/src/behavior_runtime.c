@@ -48,6 +48,12 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #define RTBEH_SETTINGS_SUBTREE "rtbeh"
 #define RTBEH_SETTINGS_KEY RTBEH_SETTINGS_SUBTREE "/b/%u"
+// Tombstone for a deleted FACTORY slot (M12). Stored under the same subtree so a
+// single settings_load("rtbeh") sees both records and tombstones; keyed by pool
+// index like the records. A deleted factory slot leaves a tombstone instead of a
+// plain delete, so the boot seed knows not to reactivate it from devicetree. A
+// non-factory delete writes no tombstone (nothing reseeds a plain spare).
+#define RTBEH_TOMBSTONE_KEY RTBEH_SETTINGS_SUBTREE "/t/%u"
 
 // On-disk format version, so a future layout change can be detected and ignored
 // rather than misread.
@@ -217,6 +223,8 @@ int zmk_behavior_runtime_save_changes(void) {
 
         char key[24];
         snprintf(key, sizeof(key), RTBEH_SETTINGS_KEY, (unsigned)slot_idx);
+        char tkey[24];
+        snprintf(tkey, sizeof(tkey), RTBEH_TOMBSTONE_KEY, (unsigned)slot_idx);
 
         int ret;
         if (slot->state->active) {
@@ -228,9 +236,25 @@ int zmk_behavior_runtime_save_changes(void) {
 
             size_t tail = serialize_config(slot, buf + sizeof(*hdr), sizeof(buf) - sizeof(*hdr));
             ret = settings_save_one(key, buf, sizeof(*hdr) + tail);
+            // A revived factory slot must drop any stale tombstone so the boot
+            // seed doesn't later treat it as deleted. Harmless for non-factory.
+            if (ret >= 0 && slot->default_active) {
+                settings_delete(tkey);
+                slot->state->tombstoned = false;
+            }
+        } else if (slot->default_active) {
+            // Deleted a FACTORY slot. A plain delete is not enough: the boot seed
+            // would reactivate it from devicetree. Persist a tombstone so it
+            // stays gone until restore-stock clears it. Drop any stale record.
+            settings_delete(key);
+            uint8_t one = 1;
+            ret = settings_save_one(tkey, &one, sizeof(one));
+            if (ret >= 0) {
+                slot->state->tombstoned = true;
+            }
         } else {
-            // Freed / never-claimed slot: drop any record it had. settings_delete
-            // on a never-saved key is harmless.
+            // Freed / never-claimed plain spare: drop any record it had. Nothing
+            // reseeds it, so no tombstone. settings_delete on an absent key is ok.
             ret = settings_delete(key);
         }
 
@@ -252,13 +276,18 @@ int zmk_behavior_runtime_discard_changes(void) {
     // RAM contents, but an unclaimed slot is hidden, so that is invisible.)
     STRUCT_SECTION_FOREACH(zmk_behavior_runtime_slot, slot) {
         slot->state->active = false;
+        slot->state->tombstoned = false;
         slot->state->name[0] = '\0';
         slot->state->dirty = false;
     }
     k_sched_unlock();
 
-    // Re-apply persisted records over the cleared pool via the settings handler.
+    // Re-apply persisted records + tombstones over the cleared pool, then re-seed
+    // factory slots that have neither, so a deleted-but-unsaved factory behaviour
+    // reappears (its config reverts fully only on a reboot, where device init
+    // re-runs from devicetree — discard restores its claimed state + name here).
     int ret = settings_load_subtree(RTBEH_SETTINGS_SUBTREE);
+    zmk_behavior_runtime_seed_factory_defaults();
 
     return ret;
 }
@@ -270,11 +299,19 @@ int zmk_behavior_runtime_reset_settings(void) {
         char key[24];
         snprintf(key, sizeof(key), RTBEH_SETTINGS_KEY, (unsigned)idx);
         settings_delete(key);
+        // Also clear factory tombstones, so restore-stock brings deleted factory
+        // behaviours back: with no record and no tombstone, the next boot's seed
+        // re-activates them from devicetree (with their shipped config, since
+        // device init re-seeds the RAM config from DT on that boot).
+        char tkey[24];
+        snprintf(tkey, sizeof(tkey), RTBEH_TOMBSTONE_KEY, (unsigned)idx);
+        settings_delete(tkey);
     }
 
     k_sched_lock();
     STRUCT_SECTION_FOREACH(zmk_behavior_runtime_slot, slot) {
         slot->state->active = false;
+        slot->state->tombstoned = false;
         slot->state->name[0] = '\0';
         slot->state->dirty = false;
     }
@@ -287,8 +324,13 @@ int zmk_behavior_runtime_reset_settings(void) {
 
 static int rtbeh_set(const char *name, size_t len, settings_read_cb read_cb, void *cb_arg) {
     const char *next;
+    bool tombstone;
 
-    if (!settings_name_steq(name, "b", &next) || !next) {
+    if (settings_name_steq(name, "b", &next) && next) {
+        tombstone = false;
+    } else if (settings_name_steq(name, "t", &next) && next) {
+        tombstone = true;
+    } else {
         return 0;
     }
 
@@ -309,6 +351,20 @@ static int rtbeh_set(const char *name, size_t len, settings_read_cb read_cb, voi
 
     const struct zmk_behavior_runtime_slot *slot;
     STRUCT_SECTION_GET(zmk_behavior_runtime_slot, idx, &slot);
+
+    if (tombstone) {
+        // A FACTORY slot the user deleted and saved (M12). Mark it so the boot
+        // seed below does NOT reactivate it from devicetree. (We don't care about
+        // the record's 1-byte marker value, but drain it so the backend advances.)
+        uint8_t marker;
+        read_cb(cb_arg, &marker, MIN(len, sizeof(marker)));
+        k_sched_lock();
+        slot->state->tombstoned = true;
+        slot->state->active = false;
+        slot->state->name[0] = '\0';
+        k_sched_unlock();
+        return 0;
+    }
 
     if (len < sizeof(struct rtbeh_record_header) || len > RTBEH_RECORD_MAX) {
         LOG_ERR("Runtime behaviour record %lu has bad size %d", idx, (int)len);
@@ -347,6 +403,24 @@ static int rtbeh_set(const char *name, size_t len, settings_read_cb read_cb, voi
     return 0;
 }
 
+void zmk_behavior_runtime_seed_factory_defaults(void) {
+    k_sched_lock();
+    STRUCT_SECTION_FOREACH(zmk_behavior_runtime_slot, slot) {
+        // Seed only factory slots that NVS hasn't already claimed (record ->
+        // active) or deleted (tombstone). The slot's RAM config is the devicetree
+        // default applied at device init, so only the claimed state + name change.
+        if (!slot->default_active || slot->state->active || slot->state->tombstoned) {
+            continue;
+        }
+        slot->state->active = true;
+        strncpy(slot->state->name, slot->default_name ? slot->default_name : "",
+                sizeof(slot->state->name) - 1);
+        slot->state->name[sizeof(slot->state->name) - 1] = '\0';
+        slot->state->dirty = false;
+    }
+    k_sched_unlock();
+}
+
 // Settings commit runs after every subsystem's `set` callbacks, i.e. after the
 // behavior local-id table has finished loading. This is where combos re-resolves
 // a runtime combo's stored sub-binding local_id -> behavior_dev (combo.c
@@ -373,6 +447,14 @@ static int rtbeh_set(const char *name, size_t len, settings_read_cb read_cb, voi
 // active slots' descriptor fields and resolve each stored local_id ->
 // behavior_dev (mirroring combo_handle_commit), since those records can load
 // before the local-id table.
-static int rtbeh_commit(void) { return 0; }
+static int rtbeh_commit(void) {
+    // Boot factory seed (M12): settings_load has now applied every record +
+    // tombstone, so activate any factory slot that has neither. This commit runs
+    // even on a fresh board with zero rtbeh records (settings_load calls each
+    // handler's commit once after loading), which is exactly when the factory
+    // behaviours must first appear.
+    zmk_behavior_runtime_seed_factory_defaults();
+    return 0;
+}
 
 SETTINGS_STATIC_HANDLER_DEFINE(rtbeh, RTBEH_SETTINGS_SUBTREE, NULL, rtbeh_set, rtbeh_commit, NULL);
