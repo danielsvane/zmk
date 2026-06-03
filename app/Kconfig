@@ -397,6 +397,24 @@ endchoice
 
 endif # ZMK_BATTERY_REPORTING
 
+config ZMK_SPLIT_BATTERY_USB_HID
+    bool "Report split peripheral battery levels over a vendor USB HID interface"
+    depends on ZMK_USB && ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING
+    help
+      Expose the peripherals' battery levels on a second, vendor-defined USB
+      HID interface (HID_1). Useful on dongle centrals where the host has no
+      BLE connection to read the proxied GATT Battery Services from. A host
+      program can read pushed input reports from the hidraw node or poll via
+      GET_REPORT.
+
+if ZMK_SPLIT_BATTERY_USB_HID
+
+# Reserve the second Zephyr USB HID instance (HID_1) next to ZMK's HID_0.
+config USB_HID_DEVICE_COUNT
+    default 2
+
+endif # ZMK_SPLIT_BATTERY_USB_HID
+
 config ZMK_IDLE_TIMEOUT
     int "Milliseconds of inactivity before entering idle state (OLED shutoff, etc)"
     default 30000
