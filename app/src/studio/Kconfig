@@ -129,7 +129,12 @@ config ZMK_STUDIO_RPC_RX_BUF_SIZE
 
 config ZMK_STUDIO_RPC_TX_BUF_SIZE
     int "TX Buffer Size"
-    default 64
+    # Transports drain this buffer once it is half full, so it has to hold a
+    # comfortable multiple of one transport fragment or the encoder stalls waiting
+    # for room on nearly every chunk and leaves the radio idle between
+    # indications. At 64 the half-full mark was 32 bytes, below the 62 a single
+    # BLE indication now carries. 256 lets the encoder run ahead of the link.
+    default 256
 
 endif
 

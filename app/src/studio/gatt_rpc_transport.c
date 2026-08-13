@@ -115,7 +115,13 @@ static int gatt_stop_rx(void) {
     return 0;
 }
 
-static uint8_t indicate_buffer[27];
+// Sized to the largest indication this build can ever send, so the runtime clamp
+// against the negotiated MTU below is the only thing that limits a fragment.
+// This was a flat 27 bytes, which threw away more than half of the 62 available
+// at ZMK's 65-byte ATT MTU. Fragment count is what BLE load time is made of: only
+// one indication may be outstanding and each needs a host confirmation, so a
+// response costs one round trip per fragment regardless of how small it is.
+static uint8_t indicate_buffer[CONFIG_BT_L2CAP_TX_MTU - 3];
 
 static void indicate_cb(struct bt_conn *conn, struct bt_gatt_indicate_params *params, uint8_t err);
 
