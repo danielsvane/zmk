@@ -131,6 +131,13 @@ static bool rpc_tx_buffer_write(pb_ostream_t *stream, const uint8_t *buf, size_t
         uint32_t claim_len = ring_buf_put_claim(&rpc_tx_buf, &write_buf, count - written);
 
         if (claim_len == 0) {
+            // The buffer is full. Ask the transport to drain rather than spinning
+            // on the assumption that it already scheduled one — a full buffer
+            // always satisfies a capacity-relative drain threshold, so this makes
+            // progress guaranteed instead of dependent on the transport's
+            // bookkeeping, and yields the CPU while we wait for room.
+            selected_transport->tx_notify(&rpc_tx_buf, 0, false, user_data);
+            k_yield();
             continue;
         }
 
@@ -199,6 +206,11 @@ static int send_response(const zmk_studio_Response *resp) {
 #if !IS_ENABLED(CONFIG_NANOPB_NO_ERRMSG)
         LOG_ERR("Failed to encode the message %s", stream.errmsg);
 #endif // !IS_ENABLED(CONFIG_NANOPB_NO_ERRMSG)
+        // Returning straight out held rpc_transport_mutex for good. The RPC
+        // thread could still re-lock it (Zephyr mutexes are owner-recursive), so
+        // requests kept working while the notification path — which runs on
+        // another thread — blocked forever.
+        k_mutex_unlock(&rpc_transport_mutex);
         return -EINVAL;
     }
 

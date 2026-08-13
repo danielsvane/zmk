@@ -7,7 +7,6 @@
 #include <zephyr/device.h>
 #include <zephyr/init.h>
 #include <sys/types.h>
-#include <zephyr/sys/atomic.h>
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/sys/ring_buffer.h>
@@ -26,7 +25,6 @@ LOG_MODULE_DECLARE(zmk_studio, CONFIG_ZMK_STUDIO_LOG_LEVEL);
 static bool handling_rx = false;
 
 static K_SEM_DEFINE(indicate_sem, 1, 1);
-static atomic_t notify_size;
 
 static void rpc_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value) {
     ARG_UNUSED(attr);
@@ -94,29 +92,20 @@ BT_GATT_SERVICE_DEFINE(
                            write_rpc_req, NULL),
     BT_GATT_CCC(rpc_ccc_cfg_changed, BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT));
 
+// How much of a response fits in one indication. That bound comes from the ATT
+// MTU, not from the link layer: ATT_HANDLE_VALUE_IND spends 3 bytes on its
+// opcode and handle. Reading conn_info.le.data_len->tx_max_len conflated the two
+// layers — with data-length extension negotiated it reports up to 251 even while
+// the ATT MTU is still the 23-byte default, and bt_gatt_indicate rejects a value
+// that large.
 static uint16_t get_notify_size_for_conn(struct bt_conn *conn) {
-    uint16_t notify_size = 23; // Default MTU size unless negotiated higher
-    struct bt_conn_info conn_info;
-    if (conn && bt_conn_get_info(conn, &conn_info) >= 0) {
-        notify_size = conn_info.le.data_len->tx_max_len;
-    }
+    // 23 is the ATT default, in force until the MTU exchange completes.
+    uint16_t mtu = conn ? bt_gatt_get_mtu(conn) : 0;
 
-    return notify_size;
-}
-
-static void refresh_notify_size(void) {
-    struct bt_conn *conn = zmk_ble_active_profile_conn();
-
-    uint16_t ns = get_notify_size_for_conn(conn);
-    if (conn) {
-        bt_conn_unref(conn);
-    }
-
-    atomic_set(&notify_size, ns);
+    return MAX(mtu, 23) - 3;
 }
 
 static int gatt_start_rx() {
-    refresh_notify_size();
     handling_rx = true;
     return 0;
 }
@@ -136,6 +125,13 @@ static struct bt_gatt_indicate_params rpc_indicate_params = {
     .func = indicate_cb,
 };
 
+static void notif_rpc_tx_cb(struct k_work *work);
+
+// Delayable so a rejected indication can be retried. -ENOMEM here is transient
+// (the connection's TX buffers are momentarily exhausted), and dropping the
+// attempt truncated the response for good.
+static K_WORK_DELAYABLE_DEFINE(notify_tx_work, notif_rpc_tx_cb);
+
 static void notif_rpc_tx_cb(struct k_work *work) {
     struct bt_conn *conn = zmk_ble_active_profile_conn();
     struct ring_buf *tx_buf = zmk_rpc_get_tx_buf();
@@ -151,70 +147,71 @@ static void notif_rpc_tx_cb(struct k_work *work) {
     if (ring_buf_size_get(tx_buf) > 0) {
         int ret = k_sem_take(&indicate_sem, K_NO_WAIT);
         if (ret < 0) {
-            return;
+            // An indication is already in flight; indicate_cb reschedules us.
+            goto release;
         }
 
         uint16_t added = 0;
-        while (added < notify_size && ring_buf_size_get(tx_buf) > 0) {
+        while (added < notify_size) {
             uint8_t *buf;
-            int len = ring_buf_get_claim(tx_buf, &buf, notify_size - added);
+            uint32_t len = ring_buf_get_claim(tx_buf, &buf, notify_size - added);
+            if (len == 0) {
+                break;
+            }
 
             memcpy(indicate_buffer + added, buf, len);
-
             added += len;
-            ring_buf_get_finish(tx_buf, len);
         }
 
         rpc_indicate_params.len = added;
 
         int err = bt_gatt_indicate(conn, &rpc_indicate_params);
+
+        // Consume the claim only once the stack has taken the data. Finishing up
+        // front and then failing discarded these bytes permanently, truncating
+        // the response mid-frame — the client then waits forever for an EOF that
+        // can never arrive, which is indistinguishable from a dead keyboard.
+        ring_buf_get_finish(tx_buf, err < 0 ? 0 : added);
+
         if (err < 0) {
-            LOG_WRN("Failed to notify the response %d", err);
+            LOG_WRN("Failed to indicate the response (%d), retrying", err);
             k_sem_give(&indicate_sem);
+            k_work_reschedule(&notify_tx_work, K_MSEC(2));
         }
     }
 
+release:
+    // Not unref'ing on every exit leaked a reference per drain, so the
+    // connection could never be freed.
     bt_conn_unref(conn);
 }
 
-static K_WORK_DEFINE(notify_tx_work, notif_rpc_tx_cb);
-
-struct gatt_write_state {
-    size_t pending_notify;
-};
-
 static void indicate_cb(struct bt_conn *conn, struct bt_gatt_indicate_params *params, uint8_t err) {
     k_sem_give(&indicate_sem);
-    k_work_submit(&notify_tx_work);
+    k_work_reschedule(&notify_tx_work, K_NO_WAIT);
 }
 
+// Drain whenever the buffer is half full, exactly as the UART transport does.
+//
+// This used to trigger on a running count of bytes written exceeding the
+// link-layer PDU size (up to 251 with data-length extension negotiated). That
+// threshold is unrelated to the ring buffer's capacity —
+// CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE, 64 bytes by default — so the count could
+// never reach it on a link with DLE: no drain was ever scheduled mid-message, and
+// once the encoder had filled those 64 bytes rpc_tx_buffer_write spun forever on
+// a zero-length claim. Any response larger than the buffer wedged the
+// RPC thread permanently: no response, no error, no disconnect, and a keyboard
+// that still typed fine because that runs on another thread. USB was immune only
+// because its transport gated on capacity, never on an absolute size.
 static void gatt_tx_notify(struct ring_buf *tx_buf, size_t added, bool msg_done, void *user_data) {
-    struct gatt_write_state *state = (struct gatt_write_state *)user_data;
-
-    state->pending_notify += added;
-
-    atomic_t ns = atomic_get(&notify_size);
-
-    if (msg_done || state->pending_notify > ns) {
-        k_work_submit(&notify_tx_work);
-        state->pending_notify = 0;
+    if (msg_done || ring_buf_size_get(tx_buf) > (ring_buf_capacity_get(tx_buf) / 2)) {
+        k_work_reschedule(&notify_tx_work, K_NO_WAIT);
     }
 }
 
-static struct gatt_write_state tx_state = {};
-
-static void *gatt_tx_user_data(void) {
-    memset(&tx_state, 0, sizeof(tx_state));
-
-    return &tx_state;
-}
-
-ZMK_RPC_TRANSPORT(gatt, ZMK_TRANSPORT_BLE, gatt_start_rx, gatt_stop_rx, gatt_tx_user_data,
-                  gatt_tx_notify);
+ZMK_RPC_TRANSPORT(gatt, ZMK_TRANSPORT_BLE, gatt_start_rx, gatt_stop_rx, NULL, gatt_tx_notify);
 
 static int gatt_rpc_listener(const zmk_event_t *eh) {
-    refresh_notify_size();
-
 #if IS_ENABLED(CONFIG_ZMK_STUDIO_LOCK_ON_DISCONNECT)
     struct bt_conn *conn = zmk_ble_active_profile_conn();
 
